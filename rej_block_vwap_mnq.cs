@@ -67,7 +67,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int    maxConsecLosses  = 10;
         private int    contracts        = 3;
         private double profitTarget     = 3000;
-        private double maxDrawdown      = 1800;
+      private double maxDrawdown = 1900;  // ← Lucid $2k limit with $100 buffer
         private double consistencyLimit = 0.45;
 
         // ─── INDICATORS ───────────────────────────────────
@@ -121,7 +121,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 TraceOrders                  = true;
 
                 WickRatio       = 2.0;
-                SlBuffer        = 3;
+            SlBuffer = 6;  // ← updated value
                 TrailActivation = 120;
                 TrailOffset     = 25;
                 MaxLossDollars  = 400;
