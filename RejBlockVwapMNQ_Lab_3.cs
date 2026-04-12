@@ -1,0 +1,665 @@
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║           RejBlockVwapMNQ_Lab — EXPERIMENTAL VERSION            ║
+// ║                                                                  ║
+// ║  ⚠️  LAB ONLY — Sim101 account ONLY — DO NOT run on live eval  ║
+// ║  Live strategy: RejBlockVwapMNQ (untouched)                     ║
+// ║  Purpose: test experimental features before promoting to live   ║
+// ║                                                                  ║
+// ║  Confirmed params (Jun 2025–Apr 2026 optimizer, April 2026):    ║
+// ║    WickRatio=2, SlBuffer=3, TrailActivation=120, TrailOffset=25 ║
+// ║    EmaPeriod=40                                                  ║
+// ║                                                                  ║
+// ║  Active experiments:                                            ║
+// ║    [1] Rejection block expiry (RejExpiryBars)                   ║
+// ║        Sweep: Min=30, Max=150, Step=10 on 1-min bars            ║
+// ║        Baseline to beat: PF 1.52 (Jun 2025–Apr 2026)           ║
+// ║                                                                  ║
+// ║  Fixes vs previous version:                                     ║
+// ║    - Discord only fires in Realtime (no backtest spam)          ║
+// ║    - Token loaded from discord_token.txt                        ║
+// ║    - SetDefaults matches private fields                         ║
+// ╚══════════════════════════════════════════════════════════════════╝
+
+using System;
+using System.Collections.Generic;
+using NinjaTrader.Cbi;
+using NinjaTrader.NinjaScript.Strategies;
+using NinjaTrader.NinjaScript.Indicators;
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+    public class RejBlockVwapMNQ_Lab : Strategy
+    {
+        // ─── PUBLIC PROPERTIES FOR OPTIMIZER ──────────────
+        [NinjaScriptProperty]
+        public double WickRatio
+        {
+            get { return wickRatio; }
+            set { wickRatio = Math.Max(1.0, value); }
+        }
+
+        [NinjaScriptProperty]
+        public double SlBuffer
+        {
+            get { return slBuffer; }
+            set { slBuffer = Math.Max(1, value); }
+        }
+
+        [NinjaScriptProperty]
+        public double TrailActivation
+        {
+            get { return trailActivation; }
+            set { trailActivation = Math.Max(10, value); }
+        }
+
+        [NinjaScriptProperty]
+        public double TrailOffset
+        {
+            get { return trailOffset; }
+            set { trailOffset = Math.Max(5, value); }
+        }
+
+        [NinjaScriptProperty]
+        public double MaxLossDollars
+        {
+            get { return maxLossDollars; }
+            set { maxLossDollars = Math.Max(100, value); }
+        }
+
+        [NinjaScriptProperty]
+        public int EmaPeriod
+        {
+            get { return emaPeriod; }
+            set { emaPeriod = Math.Max(5, value); }
+        }
+
+        [NinjaScriptProperty]
+        public int MaxConsecLosses
+        {
+            get { return maxConsecLosses; }
+            set { maxConsecLosses = Math.Max(1, value); }
+        }
+
+        [NinjaScriptProperty]
+        public bool SkipToday
+        {
+            get { return skipToday; }
+            set { skipToday = value; }
+        }
+
+        [NinjaScriptProperty]
+        public int NewsBufferMinutes
+        {
+            get { return newsBufferMinutes; }
+            set { newsBufferMinutes = Math.Max(0, value); }
+        }
+
+        [NinjaScriptProperty]
+        public int RejExpiryBars
+        {
+            get { return rejExpiryBars; }
+            set { rejExpiryBars = Math.Max(1, value); }
+        }
+
+        // ─── PARAMETERS ───────────────────────────────────
+        private double wickRatio        = 2.0;
+        private double slBuffer         = 3;
+        private double trailActivation  = 120;
+        private double trailOffset      = 25;
+        private double maxLossDollars   = 400;
+        private int    emaPeriod        = 40;
+        private int    maxConsecLosses  = 10;
+        private int    contracts        = 3;
+        private double profitTarget     = 3000;
+        private double maxDrawdown      = 1900;
+        private double consistencyLimit = 0.45;
+        private bool   skipToday        = false;
+        private int    newsBufferMinutes = 30;
+        private int    rejExpiryBars    = 999; // effectively disabled by default
+
+        // ─── DISCORD ──────────────────────────────────────
+        private string discordBotToken  = "";
+        private string discordChannelId = "1490716489211449425";
+
+        // ─── INDICATORS ───────────────────────────────────
+        private EMA ema;
+
+        // ─── SESSION STATE ────────────────────────────────
+        private bool   tradedToday    = false;
+        private bool   evalPassed     = false;
+        private bool   dailyHalted    = false;
+        private bool   lastBullishRej = false;
+        private bool   lastBearishRej = false;
+        private double lastRejHigh    = 0;
+        private double lastRejLow     = 0;
+        private int    lastRejBar     = 0;
+
+        // ─── CONSECUTIVE LOSS TRACKING ────────────────────
+        private int  consecLosses = 0;
+        private bool consecHalted = false;
+
+        // ─── NEWS FILTER ──────────────────────────────────
+        private bool           newsHaltActive = false;
+        private List<DateTime> newsEvents     = new List<DateTime>();
+
+        // ─── ACCOUNT TRACKING ─────────────────────────────
+        private double startingBalance = 0;
+        private double dayStartEquity  = 0;
+        private double totalProfit     = 0;
+        private double todayProfit     = 0;
+
+        // ─── VWAP ─────────────────────────────────────────
+        private double vwapCumTPVol = 0;
+        private double vwapCumVol   = 0;
+
+        // ─── POSITION STATE ───────────────────────────────
+        private double stopPrice     = 0;
+        private double entryPrice    = 0;
+        private double highWaterMark = 0;
+        private double lowWaterMark  = 0;
+        private bool   trailActive   = false;
+        private bool   partialTaken  = false;
+        private string tradeSide     = "";
+        private double initialRisk   = 0;
+
+        // ─── DISCORD TOKEN LOADER ─────────────────────────
+        private void LoadDiscordToken()
+        {
+            try
+            {
+                string tokenPath = System.IO.Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                    "NinjaTrader 8", "discord_token.txt");
+                if (System.IO.File.Exists(tokenPath))
+                {
+                    discordBotToken = System.IO.File.ReadAllText(tokenPath).Trim();
+                    Print("Discord token loaded OK");
+                }
+                else
+                    Print("discord_token.txt not found — alerts disabled");
+            }
+            catch (Exception ex) { Print("Discord token load failed: " + ex.Message); }
+        }
+
+        // ─── DISCORD ALERT ────────────────────────────────
+        private void SendDiscordAlert(string message)
+        {
+            if (State != State.Realtime) return;
+            if (string.IsNullOrEmpty(discordBotToken)) return;
+            try
+            {
+                using (System.Net.WebClient client = new System.Net.WebClient())
+                {
+                    client.Headers[System.Net.HttpRequestHeader.Authorization] = "Bot " + discordBotToken;
+                    client.Headers[System.Net.HttpRequestHeader.ContentType]   = "application/json";
+                    string json = "{\"content\": \"[LAB] " + message.Replace("\"", "'") + "\"}";
+                    string url  = "https://discord.com/api/v10/channels/" + discordChannelId + "/messages";
+                    client.UploadString(url, "POST", json);
+                }
+            }
+            catch (Exception ex) { Print("Discord alert failed: " + ex.Message); }
+        }
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Name                         = "RejBlockVwapMNQ_Lab";
+                Description                  = "[LAB] Rejection Block + VWAP + EMA — Experimental Sandbox on Sim101";
+                Calculate                    = Calculate.OnBarClose;
+                EntriesPerDirection          = 1;
+                EntryHandling                = EntryHandling.AllEntries;
+                IsExitOnSessionCloseStrategy = true;
+                ExitOnSessionCloseSeconds    = 900;
+                BarsRequiredToTrade          = 60;
+                TraceOrders                  = true;
+
+                WickRatio         = 2.0;
+                SlBuffer          = 3;
+                TrailActivation   = 120;
+                TrailOffset       = 25;
+                MaxLossDollars    = 400;
+                EmaPeriod         = 40;
+                MaxConsecLosses   = 10;
+                SkipToday         = false;
+                NewsBufferMinutes = 30;
+                RejExpiryBars     = 999;
+            }
+            else if (State == State.DataLoaded)
+            {
+                ema             = EMA(Close, emaPeriod);
+                startingBalance = 0;
+                dayStartEquity  = 0;
+                LoadDiscordToken();
+                LoadNewsEvents();
+            }
+        }
+
+        // ─── LOAD NEWS EVENTS ─────────────────────────────
+        private void LoadNewsEvents()
+        {
+            newsEvents.Clear();
+            LoadHardcodedNews();
+            Print("News events loaded: " + newsEvents.Count);
+        }
+
+        private void LoadHardcodedNews()
+        {
+            int[] nfpYears  = { 2025,2025,2025,2025,2025,2025,2025,2025,2025,2025,2025,2025,
+                                 2026,2026,2026,2026,2026,2026 };
+            int[] nfpMonths = { 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,
+                                 1, 2, 3, 4, 5, 6 };
+            int[] nfpDays   = { 10, 7, 7, 4, 2, 6, 4, 1, 5, 3, 7, 5,
+                                  9, 6, 6, 3, 2, 5 };
+            for (int i = 0; i < nfpYears.Length; i++)
+                newsEvents.Add(new DateTime(nfpYears[i], nfpMonths[i], nfpDays[i], 8, 30, 0));
+
+            int[] fomcYears  = { 2025,2025,2025,2025,2025,2025,2025,2025,
+                                  2026,2026,2026,2026,2026,2026,2026,2026 };
+            int[] fomcMonths = { 1, 3, 5, 6, 7, 9,11,12,
+                                  1, 3, 4, 6, 7, 9,10,12 };
+            int[] fomcDays   = { 29,19, 7,18,30,17, 7,10,
+                                  28,18,29,17,29,16,28, 9 };
+            for (int i = 0; i < fomcYears.Length; i++)
+                newsEvents.Add(new DateTime(fomcYears[i], fomcMonths[i], fomcDays[i], 14, 0, 0));
+
+            int[] cpiYears  = { 2025,2025,2025,2025,2025,2025,2025,2025,2025,2025,2025,2025,
+                                 2026,2026,2026,2026,2026,2026 };
+            int[] cpiMonths = { 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,
+                                 1, 2, 3, 4, 5, 6 };
+            int[] cpiDays   = { 15,12,12,10,13,11,15,12,10,15,13,10,
+                                 15,11,11,14,13,11 };
+            for (int i = 0; i < cpiYears.Length; i++)
+                newsEvents.Add(new DateTime(cpiYears[i], cpiMonths[i], cpiDays[i], 8, 30, 0));
+
+            Print("Hardcoded news loaded: " + newsEvents.Count + " events");
+        }
+
+        private bool IsNewsBlackout(DateTime barTime)
+        {
+            foreach (var newsTime in newsEvents)
+            {
+                if (newsTime.Date != barTime.Date) continue;
+                double minutesDiff = Math.Abs((barTime - newsTime).TotalMinutes);
+                if (minutesDiff <= newsBufferMinutes)
+                {
+                    if (!newsHaltActive)
+                    {
+                        newsHaltActive = true;
+                        Print(barTime + " NEWS BLACKOUT — within " + newsBufferMinutes
+                            + " min of event at " + newsTime.ToString("HH:mm"));
+                    }
+                    return true;
+                }
+            }
+            if (newsHaltActive)
+            {
+                newsHaltActive = false;
+                Print(barTime + " NEWS BLACKOUT lifted");
+            }
+            return false;
+        }
+
+        protected override void OnBarUpdate()
+        {
+            if (CurrentBar < BarsRequiredToTrade) return;
+            if (CurrentBar < emaPeriod) return;
+            if (evalPassed) return;
+
+            if (startingBalance == 0)
+            {
+                startingBalance = Account.Get(AccountItem.CashValue, Currency.UsDollar);
+                dayStartEquity  = startingBalance;
+                Print(Time[0] + " [LAB] Starting balance: $" + startingBalance.ToString("F2"));
+                SendDiscordAlert("🧪 LAB STARTED | Balance: $" + startingBalance.ToString("F2")
+                    + " | Sim101 — NOT live");
+            }
+
+            int hour   = Time[0].Hour;
+            int minute = Time[0].Minute;
+
+            if (hour == 9 && minute == 30)
+            {
+                tradedToday    = false;
+                dailyHalted    = false;
+                lastBullishRej = false;
+                lastBearishRej = false;
+                lastRejHigh    = 0;
+                lastRejLow     = 0;
+                lastRejBar     = 0;
+                vwapCumTPVol   = 0;
+                vwapCumVol     = 0;
+                trailActive    = false;
+                partialTaken   = false;
+                highWaterMark  = 0;
+                lowWaterMark   = 0;
+                tradeSide      = "";
+                initialRisk    = 0;
+                dayStartEquity = Account.Get(AccountItem.CashValue, Currency.UsDollar);
+                todayProfit    = 0;
+                consecLosses   = 0;
+                consecHalted   = false;
+                newsHaltActive = false;
+
+                double equity   = Account.Get(AccountItem.CashValue, Currency.UsDollar);
+                double totalPnl = equity - startingBalance;
+                string pnlStr   = (totalPnl >= 0 ? "+$" : "-$") + Math.Abs(totalPnl).ToString("F2");
+                SendDiscordAlert("🧪 LAB SESSION | Equity: $" + equity.ToString("F2")
+                    + " | Total PnL: " + pnlStr);
+            }
+
+            if (hour >= 9 && hour < 16)
+            {
+                double hlc3   = (High[0] + Low[0] + Close[0]) / 3.0;
+                vwapCumTPVol += hlc3 * Volume[0];
+                vwapCumVol   += Volume[0];
+            }
+
+            CheckPropFirmRules();
+
+            if (Position.MarketPosition != MarketPosition.Flat)
+            {
+                ManagePosition();
+                return;
+            }
+
+            if (skipToday) return;
+
+            bool isLunch = (hour == 12) || (hour == 13 && minute < 30);
+            if (isLunch) return;
+
+            if (IsNewsBlackout(Time[0])) return;
+
+            if (hour < 9 || hour >= 15) return;
+            if (tradedToday || dailyHalted || evalPassed) return;
+            if (consecHalted) return;
+            if (vwapCumVol == 0) return;
+            if (ema == null) return;
+
+            DetectRejections();
+            TryEntry();
+        }
+
+        private void DetectRejections()
+        {
+            double o         = Open[0];
+            double h         = High[0];
+            double l         = Low[0];
+            double c         = Close[0];
+            double body      = Math.Abs(c - o);
+            bool   validBody = body > 0;
+            double upperWick = h - Math.Max(o, c);
+            double lowerWick = Math.Min(o, c) - l;
+
+            bool bearishRej = validBody
+                && upperWick > body * wickRatio
+                && c < o
+                && lowerWick < body * 0.5;
+
+            bool bullishRej = validBody
+                && lowerWick > body * wickRatio
+                && c > o
+                && upperWick < body * 0.5;
+
+            if (bearishRej)
+            {
+                lastRejHigh    = h;
+                lastRejLow     = l;
+                lastBearishRej = true;
+                lastBullishRej = false;
+                lastRejBar     = CurrentBar;
+                Print(Time[0] + " BEARISH REJ h=" + h + " l=" + l);
+            }
+            if (bullishRej)
+            {
+                lastRejHigh    = h;
+                lastRejLow     = l;
+                lastBullishRej = true;
+                lastBearishRej = false;
+                lastRejBar     = CurrentBar;
+                Print(Time[0] + " BULLISH REJ h=" + h + " l=" + l);
+            }
+        }
+
+        private void TryEntry()
+        {
+            if (vwapCumVol == 0) return;
+            if (ema == null) return;
+
+            // ── Rejection block expiry ────────────────────
+            if (lastRejBar > 0 && (CurrentBar - lastRejBar) > rejExpiryBars)
+            {
+                if (lastBullishRej || lastBearishRej)
+                    Print(Time[0] + " REJ BLOCK EXPIRED after "
+                        + (CurrentBar - lastRejBar) + " bars — invalidated");
+                lastBullishRej = false;
+                lastBearishRej = false;
+                lastRejHigh    = 0;
+                lastRejLow     = 0;
+            }
+
+            double vwap   = vwapCumTPVol / vwapCumVol;
+            double emaVal = ema[0];
+            double c      = Close[0];
+
+            if (lastBullishRej
+                && lastRejLow > 0
+                && c <= lastRejLow * 1.001
+                && c > vwap
+                && c > emaVal)
+            {
+                double sl          = lastRejLow - slBuffer;
+                double riskDollars = (c - sl) * contracts * 2;
+                if (riskDollars > maxLossDollars)
+                    sl = c - (maxLossDollars / (contracts * 2));
+
+                stopPrice     = sl;
+                entryPrice    = c;
+                initialRisk   = c - sl;
+                highWaterMark = c;
+                trailActive   = false;
+                partialTaken  = false;
+                tradeSide     = "long";
+
+                EnterLong(contracts, "RB Long");
+                tradedToday = true;
+
+                Print(Time[0] + " [LAB] LONG entry=" + c.ToString("F2")
+                    + " sl=" + sl.ToString("F2")
+                    + " vwap=" + vwap.ToString("F2")
+                    + " ema=" + emaVal.ToString("F2"));
+
+                SendDiscordAlert("📈 LAB LONG | Price: " + c.ToString("F2")
+                    + " | SL: " + sl.ToString("F2")
+                    + " | " + Time[0].ToString("HH:mm ET"));
+            }
+            else if (lastBearishRej
+                && lastRejHigh > 0
+                && c >= lastRejHigh * 0.999
+                && c < vwap
+                && c < emaVal)
+            {
+                double sl          = lastRejHigh + slBuffer;
+                double riskDollars = (sl - c) * contracts * 2;
+                if (riskDollars > maxLossDollars)
+                    sl = c + (maxLossDollars / (contracts * 2));
+
+                stopPrice    = sl;
+                entryPrice   = c;
+                initialRisk  = sl - c;
+                lowWaterMark = c;
+                trailActive  = false;
+                partialTaken = false;
+                tradeSide    = "short";
+
+                EnterShort(contracts, "RB Short");
+                tradedToday = true;
+
+                Print(Time[0] + " [LAB] SHORT entry=" + c.ToString("F2")
+                    + " sl=" + sl.ToString("F2")
+                    + " vwap=" + vwap.ToString("F2")
+                    + " ema=" + emaVal.ToString("F2"));
+
+                SendDiscordAlert("📉 LAB SHORT | Price: " + c.ToString("F2")
+                    + " | SL: " + sl.ToString("F2")
+                    + " | " + Time[0].ToString("HH:mm ET"));
+            }
+        }
+
+        private void ManagePosition()
+        {
+            double c = Close[0];
+
+            if (tradeSide == "long")
+            {
+                if (High[0] > highWaterMark)
+                    highWaterMark = High[0];
+
+                if (!partialTaken && initialRisk > 0
+                    && c >= entryPrice + initialRisk
+                    && Position.Quantity > 1)
+                {
+                    ExitLong(1, "Partial TP", "RB Long");
+                    partialTaken = true;
+                    stopPrice    = entryPrice;
+                    Print(Time[0] + " [LAB] PARTIAL TP long @ " + c.ToString("F2"));
+                    SendDiscordAlert("✂️ LAB PARTIAL TP LONG | Price: " + c.ToString("F2")
+                        + " | Stop → BE: " + entryPrice.ToString("F2"));
+                }
+
+                double profitPts = highWaterMark - entryPrice;
+                if (profitPts >= trailActivation && !trailActive)
+                {
+                    trailActive = true;
+                    Print(Time[0] + " [LAB] TRAIL ACTIVATED long");
+                }
+                if (trailActive)
+                {
+                    double newStop = highWaterMark - trailOffset;
+                    if (newStop > stopPrice) stopPrice = newStop;
+                }
+
+                if (c <= stopPrice)
+                {
+                    double pnl      = (c - entryPrice) * Position.Quantity * 2;
+                    string exitType = trailActive ? "TRAIL EXIT" : "STOP LOSS";
+                    UpdateConsecLosses(pnl);
+                    ExitLong("SL", "RB Long");
+                    Print(Time[0] + " [LAB] " + exitType + " long @ " + c.ToString("F2"));
+                    SendDiscordAlert((pnl >= 0 ? "✅" : "❌") + " LAB LONG CLOSED (" + exitType + ")"
+                        + " | PnL: " + (pnl >= 0 ? "+$" : "-$") + Math.Abs(pnl).ToString("F2"));
+                    tradeSide    = "";
+                    partialTaken = false;
+                }
+            }
+            else if (tradeSide == "short")
+            {
+                if (Low[0] < lowWaterMark || lowWaterMark == 0)
+                    lowWaterMark = Low[0];
+
+                if (!partialTaken && initialRisk > 0
+                    && c <= entryPrice - initialRisk
+                    && Position.Quantity > 1)
+                {
+                    ExitShort(1, "Partial TP", "RB Short");
+                    partialTaken = true;
+                    stopPrice    = entryPrice;
+                    Print(Time[0] + " [LAB] PARTIAL TP short @ " + c.ToString("F2"));
+                    SendDiscordAlert("✂️ LAB PARTIAL TP SHORT | Price: " + c.ToString("F2")
+                        + " | Stop → BE: " + entryPrice.ToString("F2"));
+                }
+
+                double profitPts = entryPrice - lowWaterMark;
+                if (profitPts >= trailActivation && !trailActive)
+                {
+                    trailActive = true;
+                    Print(Time[0] + " [LAB] TRAIL ACTIVATED short");
+                }
+                if (trailActive)
+                {
+                    double newStop = lowWaterMark + trailOffset;
+                    if (newStop < stopPrice) stopPrice = newStop;
+                }
+
+                if (c >= stopPrice)
+                {
+                    double pnl      = (entryPrice - c) * Position.Quantity * 2;
+                    string exitType = trailActive ? "TRAIL EXIT" : "STOP LOSS";
+                    UpdateConsecLosses(pnl);
+                    ExitShort("SL", "RB Short");
+                    Print(Time[0] + " [LAB] " + exitType + " short @ " + c.ToString("F2"));
+                    SendDiscordAlert((pnl >= 0 ? "✅" : "❌") + " LAB SHORT CLOSED (" + exitType + ")"
+                        + " | PnL: " + (pnl >= 0 ? "+$" : "-$") + Math.Abs(pnl).ToString("F2"));
+                    tradeSide    = "";
+                    partialTaken = false;
+                }
+            }
+        }
+
+        private void UpdateConsecLosses(double pnl)
+        {
+            if (pnl > 0)
+            {
+                consecLosses = 0;
+                consecHalted = false;
+                Print(Time[0] + " WIN — consecLosses reset");
+            }
+            else
+            {
+                consecLosses++;
+                Print(Time[0] + " LOSS — consecLosses=" + consecLosses);
+                if (consecLosses >= maxConsecLosses)
+                {
+                    consecHalted = true;
+                    Print(Time[0] + " [LAB] CONSEC LOSS HALT");
+                    SendDiscordAlert("⛔ LAB CONSEC LOSS HALT | " + consecLosses + " losses — paused");
+                }
+            }
+        }
+
+        private void CheckPropFirmRules()
+        {
+            if (startingBalance == 0) return;
+
+            double equity = Account.Get(AccountItem.CashValue, Currency.UsDollar);
+            todayProfit   = equity - dayStartEquity;
+            totalProfit   = equity - startingBalance;
+
+            if (totalProfit >= profitTarget && !evalPassed)
+            {
+                evalPassed = true;
+                ExitLong("Eval Passed", "RB Long");
+                ExitShort("Eval Passed", "RB Short");
+                Print(Time[0] + " [LAB] SIM TARGET HIT $" + totalProfit.ToString("F2"));
+                SendDiscordAlert("🏆 LAB SIM TARGET HIT | +$" + totalProfit.ToString("F2")
+                    + " | Sim only — no action needed");
+                return;
+            }
+
+            double drawdown = startingBalance - equity;
+            if (drawdown >= maxDrawdown && !dailyHalted)
+            {
+                dailyHalted = true;
+                ExitLong("DD Halt", "RB Long");
+                ExitShort("DD Halt", "RB Short");
+                Print(Time[0] + " [LAB] DRAWDOWN HALT $" + drawdown.ToString("F2"));
+                SendDiscordAlert("🚨 LAB DRAWDOWN HALT | -$" + drawdown.ToString("F2"));
+                return;
+            }
+
+            if (totalProfit > 0 && !dailyHalted)
+            {
+                double pct = todayProfit / totalProfit;
+                if (pct >= consistencyLimit)
+                {
+                    dailyHalted = true;
+                    ExitLong("Consistency Halt", "RB Long");
+                    ExitShort("Consistency Halt", "RB Short");
+                    Print(Time[0] + " [LAB] CONSISTENCY HALT " + (pct * 100).ToString("F1") + "%");
+                    SendDiscordAlert("⚠️ LAB CONSISTENCY HALT | Today = "
+                        + (pct * 100).ToString("F1") + "% of total");
+                }
+            }
+        }
+    }
+}
