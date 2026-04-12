@@ -2,22 +2,16 @@
 // ║           RejBlockVwapMNQ_Lab — EXPERIMENTAL VERSION            ║
 // ║                                                                  ║
 // ║  ⚠️  LAB ONLY — Sim101 account ONLY — DO NOT run on live eval  ║
-// ║  Live strategy: RejBlockVwapMNQ (untouched)                     ║
-// ║  Purpose: test experimental features before promoting to live   ║
 // ║                                                                  ║
-// ║  Confirmed params (Jun 2025–Apr 2026 optimizer, April 2026):    ║
+// ║  Confirmed params (Jan 2025–Apr 2026 optimizer, April 2026):    ║
 // ║    WickRatio=2, SlBuffer=3, TrailActivation=120, TrailOffset=25 ║
-// ║    EmaPeriod=40                                                  ║
+// ║    EmaPeriod=40, RejExpiryBars=30 (promoted to live Apr 2026)  ║
 // ║                                                                  ║
-// ║  Active experiments:                                            ║
-// ║    [1] Rejection block expiry (RejExpiryBars)                   ║
-// ║        Sweep: Min=30, Max=150, Step=10 on 1-min bars            ║
-// ║        Baseline to beat: PF 1.52 (Jun 2025–Apr 2026)           ║
-// ║                                                                  ║
-// ║  Fixes vs previous version:                                     ║
-// ║    - Discord only fires in Realtime (no backtest spam)          ║
-// ║    - Token loaded from discord_token.txt                        ║
-// ║    - SetDefaults matches private fields                         ║
+// ║  Next experiment queued:                                        ║
+// ║    [2] ATR dynamic stop sizing                                  ║
+// ║        Replace fixed SlBuffer with ATR(14) * multiplier        ║
+// ║        Sweep: AtrMultiplier 0.1→0.5, step 0.1                  ║
+// ║        Baseline to beat: PF 1.34 (Jan 2025–Apr 2026)           ║
 // ╚══════════════════════════════════════════════════════════════════╝
 
 using System;
@@ -101,6 +95,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             set { rejExpiryBars = Math.Max(1, value); }
         }
 
+        [NinjaScriptProperty]
+        public double AtrMultiplier
+        {
+            get { return atrMultiplier; }
+            set { atrMultiplier = Math.Max(0.01, value); }
+        }
+
         // ─── PARAMETERS ───────────────────────────────────
         private double wickRatio        = 2.0;
         private double slBuffer         = 3;
@@ -115,7 +116,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double consistencyLimit = 0.45;
         private bool   skipToday        = false;
         private int    newsBufferMinutes = 30;
-        private int    rejExpiryBars    = 999; // effectively disabled by default
+        private int    rejExpiryBars    = 30;
+        private double atrMultiplier    = 0.3; // ATR(14) * multiplier replaces fixed slBuffer
 
         // ─── DISCORD ──────────────────────────────────────
         private string discordBotToken  = "";
@@ -123,6 +125,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // ─── INDICATORS ───────────────────────────────────
         private EMA ema;
+        private ATR atr;
 
         // ─── SESSION STATE ────────────────────────────────
         private bool   tradedToday    = false;
@@ -223,11 +226,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 MaxConsecLosses   = 10;
                 SkipToday         = false;
                 NewsBufferMinutes = 30;
-                RejExpiryBars     = 999;
+                RejExpiryBars     = 30;
+                AtrMultiplier     = 0.3;
             }
             else if (State == State.DataLoaded)
             {
                 ema             = EMA(Close, emaPeriod);
+                atr             = ATR(Close, 14);
                 startingBalance = 0;
                 dayStartEquity  = 0;
                 LoadDiscordToken();
@@ -448,7 +453,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 && c > vwap
                 && c > emaVal)
             {
-                double sl          = lastRejLow - slBuffer;
+                // ── ATR dynamic stop ──────────────────────
+                double dynamicBuffer = (atr != null && atr[0] > 0) ? atr[0] * atrMultiplier : slBuffer;
+                double sl          = lastRejLow - dynamicBuffer;
                 double riskDollars = (c - sl) * contracts * 2;
                 if (riskDollars > maxLossDollars)
                     sl = c - (maxLossDollars / (contracts * 2));
@@ -466,6 +473,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 Print(Time[0] + " [LAB] LONG entry=" + c.ToString("F2")
                     + " sl=" + sl.ToString("F2")
+                    + " atrBuf=" + dynamicBuffer.ToString("F2")
                     + " vwap=" + vwap.ToString("F2")
                     + " ema=" + emaVal.ToString("F2"));
 
@@ -479,7 +487,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 && c < vwap
                 && c < emaVal)
             {
-                double sl          = lastRejHigh + slBuffer;
+                // ── ATR dynamic stop ──────────────────────
+                double dynamicBuffer = (atr != null && atr[0] > 0) ? atr[0] * atrMultiplier : slBuffer;
+                double sl          = lastRejHigh + dynamicBuffer;
                 double riskDollars = (sl - c) * contracts * 2;
                 if (riskDollars > maxLossDollars)
                     sl = c + (maxLossDollars / (contracts * 2));
@@ -497,6 +507,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 Print(Time[0] + " [LAB] SHORT entry=" + c.ToString("F2")
                     + " sl=" + sl.ToString("F2")
+                    + " atrBuf=" + dynamicBuffer.ToString("F2")
                     + " vwap=" + vwap.ToString("F2")
                     + " ema=" + emaVal.ToString("F2"));
 
