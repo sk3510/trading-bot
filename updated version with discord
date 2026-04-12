@@ -1,3 +1,20 @@
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║              RejBlockVwapMNQ — LIVE VERSION                     ║
+// ║                                                                  ║
+// ║  Platform : NinjaTrader 8                                       ║
+// ║  Instrument: MNQ (1-minute bars)                                ║
+// ║  Account  : MFFU / Lucid eval                                   ║
+// ║                                                                  ║
+// ║  Confirmed params (Jun 2025–Apr 2026 optimizer, April 2026):    ║
+// ║    WickRatio=2, SlBuffer=3, TrailActivation=120, TrailOffset=25 ║
+// ║    EmaPeriod=40                                                  ║
+// ║                                                                  ║
+// ║  Fixes vs previous version:                                     ║
+// ║    - Discord only fires in Realtime (no backtest spam)          ║
+// ║    - Token loaded from discord_token.txt (not hardcoded)        ║
+// ║    - SetDefaults matches private fields                         ║
+// ╚══════════════════════════════════════════════════════════════════╝
+
 using System;
 using System.Collections.Generic;
 using NinjaTrader.Cbi;
@@ -73,43 +90,43 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // ─── PARAMETERS ───────────────────────────────────
-        private double wickRatio         = 2.0;
-        private double slBuffer          = 6;
-        private double trailActivation   = 120;
-        private double trailOffset       = 25;
-        private double maxLossDollars    = 400;
-        private int    emaPeriod         = 40;
-        private int    maxConsecLosses   = 10;
-        private int    contracts         = 3;
-        private double profitTarget      = 3000;
-        private double maxDrawdown       = 1900;
-        private double consistencyLimit  = 0.45;
-        private bool   skipToday         = false;
+        private double wickRatio        = 2.0;
+        private double slBuffer         = 3;
+        private double trailActivation  = 120;
+        private double trailOffset      = 25;
+        private double maxLossDollars   = 400;
+        private int    emaPeriod        = 40;
+        private int    maxConsecLosses  = 10;
+        private int    contracts        = 3;
+        private double profitTarget     = 3000;
+        private double maxDrawdown      = 1900;
+        private double consistencyLimit = 0.45;
+        private bool   skipToday        = false;
         private int    newsBufferMinutes = 30;
 
         // ─── DISCORD ──────────────────────────────────────
-       
-        private string discordChannelId  = "1490716489211449425";
+        private string discordBotToken  = "";
+        private string discordChannelId = "1490716489211449425";
 
         // ─── INDICATORS ───────────────────────────────────
         private EMA ema;
 
         // ─── SESSION STATE ────────────────────────────────
-        private bool   tradedToday     = false;
-        private bool   evalPassed      = false;
-        private bool   dailyHalted     = false;
-        private bool   lastBullishRej  = false;
-        private bool   lastBearishRej  = false;
-        private double lastRejHigh     = 0;
-        private double lastRejLow      = 0;
+        private bool   tradedToday    = false;
+        private bool   evalPassed     = false;
+        private bool   dailyHalted    = false;
+        private bool   lastBullishRej = false;
+        private bool   lastBearishRej = false;
+        private double lastRejHigh    = 0;
+        private double lastRejLow     = 0;
 
         // ─── CONSECUTIVE LOSS TRACKING ────────────────────
-        private int    consecLosses    = 0;
-        private bool   consecHalted    = false;
+        private int  consecLosses = 0;
+        private bool consecHalted = false;
 
         // ─── NEWS FILTER ──────────────────────────────────
-        private bool   newsHaltActive  = false;
-        private List<DateTime> newsEvents = new List<DateTime>();
+        private bool           newsHaltActive = false;
+        private List<DateTime> newsEvents     = new List<DateTime>();
 
         // ─── ACCOUNT TRACKING ─────────────────────────────
         private double startingBalance = 0;
@@ -118,22 +135,43 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double todayProfit     = 0;
 
         // ─── VWAP ─────────────────────────────────────────
-        private double vwapCumTPVol    = 0;
-        private double vwapCumVol      = 0;
+        private double vwapCumTPVol = 0;
+        private double vwapCumVol   = 0;
 
         // ─── POSITION STATE ───────────────────────────────
-        private double stopPrice       = 0;
-        private double entryPrice      = 0;
-        private double highWaterMark   = 0;
-        private double lowWaterMark    = 0;
-        private bool   trailActive     = false;
-        private bool   partialTaken    = false;
-        private string tradeSide       = "";
-        private double initialRisk     = 0;
+        private double stopPrice     = 0;
+        private double entryPrice    = 0;
+        private double highWaterMark = 0;
+        private double lowWaterMark  = 0;
+        private bool   trailActive   = false;
+        private bool   partialTaken  = false;
+        private string tradeSide     = "";
+        private double initialRisk   = 0;
+
+        // ─── DISCORD TOKEN LOADER ─────────────────────────
+        private void LoadDiscordToken()
+        {
+            try
+            {
+                string tokenPath = System.IO.Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                    "NinjaTrader 8", "discord_token.txt");
+                if (System.IO.File.Exists(tokenPath))
+                {
+                    discordBotToken = System.IO.File.ReadAllText(tokenPath).Trim();
+                    Print("Discord token loaded OK");
+                }
+                else
+                    Print("discord_token.txt not found — alerts disabled");
+            }
+            catch (Exception ex) { Print("Discord token load failed: " + ex.Message); }
+        }
 
         // ─── DISCORD ALERT ────────────────────────────────
         private void SendDiscordAlert(string message)
         {
+            if (State != State.Realtime) return;
+            if (string.IsNullOrEmpty(discordBotToken)) return;
             try
             {
                 using (System.Net.WebClient client = new System.Net.WebClient())
@@ -145,10 +183,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     client.UploadString(url, "POST", json);
                 }
             }
-            catch (Exception ex)
-            {
-                Print("Discord alert failed: " + ex.Message);
-            }
+            catch (Exception ex) { Print("Discord alert failed: " + ex.Message); }
         }
 
         protected override void OnStateChange()
@@ -156,7 +191,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (State == State.SetDefaults)
             {
                 Name                         = "RejBlockVwapMNQ";
-                Description                  = "Rejection Block + VWAP + EMA + Lunch Filter + Auto News Filter on MNQ";
+                Description                  = "Rejection Block + VWAP + EMA + Lunch Filter + News Filter on MNQ";
                 Calculate                    = Calculate.OnBarClose;
                 EntriesPerDirection          = 1;
                 EntryHandling                = EntryHandling.AllEntries;
@@ -166,7 +201,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 TraceOrders                  = true;
 
                 WickRatio         = 2.0;
-                SlBuffer          = 6;
+                SlBuffer          = 3;
                 TrailActivation   = 120;
                 TrailOffset       = 25;
                 MaxLossDollars    = 400;
@@ -180,19 +215,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ema             = EMA(Close, emaPeriod);
                 startingBalance = 0;
                 dayStartEquity  = 0;
+                LoadDiscordToken();
                 LoadNewsEvents();
             }
         }
 
-        // ─── LOAD HIGH IMPACT NEWS EVENTS ─────────────────
+        // ─── LOAD NEWS EVENTS ─────────────────────────────
         private void LoadNewsEvents()
         {
             newsEvents.Clear();
             LoadHardcodedNews();
-            Print("Total high-impact USD news events loaded (hardcoded): " + newsEvents.Count);
+            Print("News events loaded: " + newsEvents.Count);
         }
 
-        // ─── HARDCODED — major 2025/2026 events ───────────
         private void LoadHardcodedNews()
         {
             // NFP — first Friday of month 8:30 AM ET
@@ -225,10 +260,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             for (int i = 0; i < cpiYears.Length; i++)
                 newsEvents.Add(new DateTime(cpiYears[i], cpiMonths[i], cpiDays[i], 8, 30, 0));
 
-            Print("Hardcoded fallback loaded: " + newsEvents.Count + " news events");
+            Print("Hardcoded news loaded: " + newsEvents.Count + " events");
         }
 
-        // ─── CHECK IF CURRENT BAR IS IN NEWS BLACKOUT ─────
         private bool IsNewsBlackout(DateTime barTime)
         {
             foreach (var newsTime in newsEvents)
@@ -249,7 +283,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (newsHaltActive)
             {
                 newsHaltActive = false;
-                Print(barTime + " NEWS BLACKOUT lifted — resuming normal trading");
+                Print(barTime + " NEWS BLACKOUT lifted");
             }
             return false;
         }
@@ -260,7 +294,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (CurrentBar < emaPeriod) return;
             if (evalPassed) return;
 
-            // ── Capture starting balance on first bar ──────
             if (startingBalance == 0)
             {
                 startingBalance = Account.Get(AccountItem.CashValue, Currency.UsDollar);
@@ -295,15 +328,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                 consecHalted   = false;
                 newsHaltActive = false;
 
-                double equity      = Account.Get(AccountItem.CashValue, Currency.UsDollar);
-                double totalPnl    = equity - startingBalance;
-                string pnlStr      = (totalPnl >= 0 ? "+$" : "-$") + Math.Abs(totalPnl).ToString("F2");
-                SendDiscordAlert("📅 NEW SESSION OPEN | Equity: $" + equity.ToString("F2")
+                double equity   = Account.Get(AccountItem.CashValue, Currency.UsDollar);
+                double totalPnl = equity - startingBalance;
+                string pnlStr   = (totalPnl >= 0 ? "+$" : "-$") + Math.Abs(totalPnl).ToString("F2");
+                SendDiscordAlert("📅 NEW SESSION | Equity: $" + equity.ToString("F2")
                     + " | Total PnL: " + pnlStr
                     + (skipToday ? " | ⚠️ SKIP TODAY ON" : ""));
 
                 if (skipToday)
-                    Print(Time[0] + " MANUAL SKIP TODAY enabled — no trades today");
+                    Print(Time[0] + " SKIP TODAY enabled");
             }
 
             // ── VWAP accumulation ─────────────────────────
@@ -314,27 +347,21 @@ namespace NinjaTrader.NinjaScript.Strategies
                 vwapCumVol   += Volume[0];
             }
 
-            // ── Prop firm checks ──────────────────────────
             CheckPropFirmRules();
 
-            // ── Manage open position ──────────────────────
             if (Position.MarketPosition != MarketPosition.Flat)
             {
                 ManagePosition();
                 return;
             }
 
-            // ── Manual skip check ─────────────────────────
             if (skipToday) return;
 
-            // ── Lunch hour filter 12:00 - 13:30 ET ────────
             bool isLunch = (hour == 12) || (hour == 13 && minute < 30);
             if (isLunch) return;
 
-            // ── Auto news blackout filter ──────────────────
             if (IsNewsBlackout(Time[0])) return;
 
-            // ── Entry logic ───────────────────────────────
             if (hour < 9 || hour >= 15) return;
             if (tradedToday || dailyHalted || evalPassed) return;
             if (consecHalted) return;
@@ -393,7 +420,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             double emaVal = ema[0];
             double c      = Close[0];
 
-            // ── Long entry ────────────────────────────────
             if (lastBullishRej
                 && lastRejLow > 0
                 && c <= lastRejLow * 1.001
@@ -426,8 +452,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     + " | Contracts: " + contracts
                     + " | " + Time[0].ToString("HH:mm ET"));
             }
-
-            // ── Short entry ───────────────────────────────
             else if (lastBearishRej
                 && lastRejHigh > 0
                 && c >= lastRejHigh * 0.999
@@ -480,7 +504,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     stopPrice    = entryPrice;
                     Print(Time[0] + " PARTIAL TP long @ " + c.ToString("F2"));
                     SendDiscordAlert("✂️ PARTIAL TP LONG | Price: " + c.ToString("F2")
-                        + " | Stop moved to BE: " + entryPrice.ToString("F2"));
+                        + " | Stop → BE: " + entryPrice.ToString("F2"));
                 }
 
                 double profitPts = highWaterMark - entryPrice;
@@ -497,10 +521,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 if (c <= stopPrice)
                 {
-                    double pnl = (c - entryPrice) * Position.Quantity * 2;
+                    double pnl      = (c - entryPrice) * Position.Quantity * 2;
+                    string exitType = trailActive ? "TRAIL EXIT" : "STOP LOSS";
                     UpdateConsecLosses(pnl);
                     ExitLong("SL", "RB Long");
-                    string exitType = trailActive ? "TRAIL EXIT" : "STOP LOSS";
                     Print(Time[0] + " " + exitType + " long @ " + c.ToString("F2"));
                     SendDiscordAlert((pnl >= 0 ? "✅" : "❌") + " LONG CLOSED (" + exitType + ")"
                         + " | Exit: " + c.ToString("F2")
@@ -523,7 +547,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     stopPrice    = entryPrice;
                     Print(Time[0] + " PARTIAL TP short @ " + c.ToString("F2"));
                     SendDiscordAlert("✂️ PARTIAL TP SHORT | Price: " + c.ToString("F2")
-                        + " | Stop moved to BE: " + entryPrice.ToString("F2"));
+                        + " | Stop → BE: " + entryPrice.ToString("F2"));
                 }
 
                 double profitPts = entryPrice - lowWaterMark;
@@ -540,10 +564,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 if (c >= stopPrice)
                 {
-                    double pnl = (entryPrice - c) * Position.Quantity * 2;
+                    double pnl      = (entryPrice - c) * Position.Quantity * 2;
+                    string exitType = trailActive ? "TRAIL EXIT" : "STOP LOSS";
                     UpdateConsecLosses(pnl);
                     ExitShort("SL", "RB Short");
-                    string exitType = trailActive ? "TRAIL EXIT" : "STOP LOSS";
                     Print(Time[0] + " " + exitType + " short @ " + c.ToString("F2"));
                     SendDiscordAlert((pnl >= 0 ? "✅" : "❌") + " SHORT CLOSED (" + exitType + ")"
                         + " | Exit: " + c.ToString("F2")
@@ -571,7 +595,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     consecHalted = true;
                     Print(Time[0] + " CONSEC LOSS HALT");
                     SendDiscordAlert("⛔ CONSEC LOSS HALT | " + consecLosses
-                        + " consecutive losses — trading paused for today");
+                        + " consecutive losses — paused for today");
                 }
             }
         }
@@ -590,8 +614,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ExitLong("Eval Passed", "RB Long");
                 ExitShort("Eval Passed", "RB Short");
                 Print(Time[0] + " EVAL PASSED $" + totalProfit.ToString("F2"));
-                SendDiscordAlert("🏆 EVAL PASSED! Total profit: $" + totalProfit.ToString("F2")
-                    + " | Target was: $" + profitTarget.ToString("F2")
+                SendDiscordAlert("🏆 EVAL PASSED! Profit: $" + totalProfit.ToString("F2")
                     + " | CHECK YOUR LUCID ACCOUNT NOW!");
                 return;
             }
@@ -605,7 +628,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print(Time[0] + " DRAWDOWN HALT $" + drawdown.ToString("F2"));
                 SendDiscordAlert("🚨 DRAWDOWN HALT | Loss: $" + drawdown.ToString("F2")
                     + " | Limit: $" + maxDrawdown.ToString("F2")
-                    + " | All positions closed. Strategy stopped for today.");
+                    + " | All positions closed.");
                 return;
             }
 
@@ -618,8 +641,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     ExitLong("Consistency Halt", "RB Long");
                     ExitShort("Consistency Halt", "RB Short");
                     Print(Time[0] + " CONSISTENCY HALT " + (pct * 100).ToString("F1") + "%");
-                    SendDiscordAlert("⚠️ CONSISTENCY HALT | Today's profit is "
-                        + (pct * 100).ToString("F1") + "% of total — limit is "
+                    SendDiscordAlert("⚠️ CONSISTENCY HALT | Today = "
+                        + (pct * 100).ToString("F1") + "% of total — limit "
                         + (consistencyLimit * 100).ToString("F0") + "%");
                 }
             }
