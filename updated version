@@ -113,7 +113,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int    rejExpiryBars    = 30;
 
         // ─── DISCORD ──────────────────────────────────────
-        private string discordBotToken  = "";
+private string discordBotToken = "";
         private string discordChannelId = "1490716489211449425";
 
         // ─── INDICATORS ───────────────────────────────────
@@ -657,19 +657,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            if (totalProfit > 0 && !dailyHalted)
+       if (!dailyHalted && todayProfit >= 1200)
             {
-                double pct = todayProfit / totalProfit;
-                if (pct >= consistencyLimit)
-                {
-                    dailyHalted = true;
-                    ExitLong("Consistency Halt", "RB Long");
-                    ExitShort("Consistency Halt", "RB Short");
-                    Print(Time[0] + " CONSISTENCY HALT " + (pct * 100).ToString("F1") + "%");
-                    SendDiscordAlert("⚠️ CONSISTENCY HALT | Today = "
-                        + (pct * 100).ToString("F1") + "% of total — limit "
-                        + (consistencyLimit * 100).ToString("F0") + "%");
-                }
+                dailyHalted = true;
+                ExitLong("Consistency Halt", "RB Long");
+                ExitShort("Consistency Halt", "RB Short");
+                Print(Time[0] + " CONSISTENCY HALT — today $" + todayProfit.ToString("F2") + " >= $1200 limit");
+                SendDiscordAlert("⚠️ CONSISTENCY HALT | Today: +$" + todayProfit.ToString("F2") + " | Lucid $1200/day limit hit");
             }
         }
     }
