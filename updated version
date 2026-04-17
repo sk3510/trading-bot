@@ -1,18 +1,24 @@
 // ╔══════════════════════════════════════════════════════════════════╗
-// ║              RejBlockVwapMNQ — LIVE VERSION                     ║
+// ║              RejBlockVwapMNQ — LIVE STRATEGY                    ║
 // ║                                                                  ║
-// ║  Platform : NinjaTrader 8                                       ║
-// ║  Instrument: MNQ (1-minute bars)                                ║
-// ║  Account  : MFFU / Lucid eval                                   ║
+// ║  Filters active:                                                 ║
+// ║    1. Lunch filter: skip 12:00–13:30 ET                         ║
+// ║    2. News blackout: hardcoded NFP/FOMC/CPI ±30 min             ║
+// ║    3. Session window: entries only 09:30–15:00 ET               ║
+// ║    4. One trade per day                                          ║
+// ║    5. Consecutive loss halt                                      ║
+// ║    6. Drawdown guard ($1,900)                                    ║
+// ║    7. Session range filter: skip if prior RTH range < 150 or    ║
+// ║       > 700 pts                                                  ║
+// ║    8. Daily profit cap: stop trading if today profit >= $1,200   ║
 // ║                                                                  ║
-// ║  Confirmed params (Jan 2025–Apr 2026 optimizer, April 2026):    ║
-// ║    WickRatio=2, SlBuffer=3, TrailActivation=120, TrailOffset=25 ║
-// ║    EmaPeriod=40, RejExpiryBars=30                               ║
+// ║  Confirmed baselines (1-min bars, slippage=2, commission on):   ║
+// ║    PF 1.77 → Jun 2025–Apr 2026 WITH session range filter        ║
+// ║    PF 1.77 → Jan 2025–Apr 2026 WITH session range filter        ║
 // ║                                                                  ║
-// ║  Changelog:                                                     ║
-// ║    v1: Base strategy                                            ║
-// ║    v2: Discord realtime fix, token from file, params updated    ║
-// ║    v3: RejExpiryBars=30 added (PF 1.21→1.34, Apr 2026)        ║
+// ║  Optimal params: WickRatio=2, SlBuffer=3, TrailActivation=120,  ║
+// ║                  TrailOffset=25, EmaPeriod=40                    ║
+// ║  Session range: MinSessionRange=150, MaxSessionRange=700         ║
 // ╚══════════════════════════════════════════════════════════════════╝
 
 using System;
@@ -89,32 +95,39 @@ namespace NinjaTrader.NinjaScript.Strategies
             set { newsBufferMinutes = Math.Max(0, value); }
         }
 
+        // ─── SESSION RANGE FILTER ─────────────────────────
+        // Skip today if prior RTH range < Min (too quiet/trending)
+        // Skip today if prior RTH range > Max (too chaotic, wide slippage)
         [NinjaScriptProperty]
-        public int RejExpiryBars
+        public double MinSessionRange
         {
-            get { return rejExpiryBars; }
-            set { rejExpiryBars = Math.Max(1, value); }
+            get { return minSessionRange; }
+            set { minSessionRange = Math.Max(0, value); }
+        }
+
+        [NinjaScriptProperty]
+        public double MaxSessionRange
+        {
+            get { return maxSessionRange; }
+            set { maxSessionRange = Math.Max(0, value); }
         }
 
         // ─── PARAMETERS ───────────────────────────────────
-        private double wickRatio        = 2.0;
-        private double slBuffer         = 3;
-        private double trailActivation  = 120;
-        private double trailOffset      = 25;
-        private double maxLossDollars   = 400;
-        private int    emaPeriod        = 40;
-        private int    maxConsecLosses  = 10;
-        private int    contracts        = 3;
-        private double profitTarget     = 3000;
-        private double maxDrawdown      = 1900;
-        private double consistencyLimit = 0.45;
-        private bool   skipToday        = false;
+        private double wickRatio         = 2.0;
+        private double slBuffer          = 3;
+        private double trailActivation   = 120;
+        private double trailOffset       = 25;
+        private double maxLossDollars    = 400;
+        private int    emaPeriod         = 40;
+        private int    maxConsecLosses   = 10;
+        private int    contracts         = 3;
+        private double profitTarget      = 3000;   // Lucid eval target
+        private double maxDrawdown       = 1900;   // Lucid drawdown limit
+        private double dailyProfitCap    = 1200;   // stop trading once today's profit >= this
+        private bool   skipToday         = false;
         private int    newsBufferMinutes = 30;
-        private int    rejExpiryBars    = 30;
-
-        // ─── DISCORD ──────────────────────────────────────
-private string discordBotToken = "";
-        private string discordChannelId = "1490716489211449425";
+        private double minSessionRange   = 150;    // proven optimal
+        private double maxSessionRange   = 700;    // cap chaotic high-slippage days
 
         // ─── INDICATORS ───────────────────────────────────
         private EMA ema;
@@ -127,11 +140,10 @@ private string discordBotToken = "";
         private bool   lastBearishRej = false;
         private double lastRejHigh    = 0;
         private double lastRejLow     = 0;
-        private int    lastRejBar     = 0;
 
         // ─── CONSECUTIVE LOSS TRACKING ────────────────────
-        private int  consecLosses = 0;
-        private bool consecHalted = false;
+        private int    consecLosses   = 0;
+        private bool   consecHalted   = false;
 
         // ─── NEWS FILTER ──────────────────────────────────
         private bool           newsHaltActive = false;
@@ -157,7 +169,17 @@ private string discordBotToken = "";
         private string tradeSide     = "";
         private double initialRisk   = 0;
 
-        // ─── DISCORD TOKEN LOADER ─────────────────────────
+        // ─── SESSION RANGE TRACKING ───────────────────────
+        private double sessionHigh     = 0;
+        private double sessionLow      = 0;
+        private double prevSessionHigh = 0;
+        private double prevSessionLow  = 0;
+        private bool   sessionRangeOk  = true;
+
+        // ─── DISCORD ──────────────────────────────────────
+        private string discordBotToken  = "";
+        private string discordChannelId = "1490716489211449425";
+
         private void LoadDiscordToken()
         {
             try
@@ -176,10 +198,9 @@ private string discordBotToken = "";
             catch (Exception ex) { Print("Discord token load failed: " + ex.Message); }
         }
 
-        // ─── DISCORD ALERT ────────────────────────────────
         private void SendDiscordAlert(string message)
         {
-            if (State != State.Realtime) return;
+            if (State != State.Realtime) return;  // NEVER remove — blocks optimizer if missing
             if (string.IsNullOrEmpty(discordBotToken)) return;
             try
             {
@@ -200,7 +221,7 @@ private string discordBotToken = "";
             if (State == State.SetDefaults)
             {
                 Name                         = "RejBlockVwapMNQ";
-                Description                  = "Rejection Block + VWAP + EMA + Lunch Filter + News Filter on MNQ";
+                Description                  = "Rejection Block + VWAP + EMA + Session Range Filter on MNQ";
                 Calculate                    = Calculate.OnBarClose;
                 EntriesPerDirection          = 1;
                 EntryHandling                = EntryHandling.AllEntries;
@@ -218,7 +239,8 @@ private string discordBotToken = "";
                 MaxConsecLosses   = 10;
                 SkipToday         = false;
                 NewsBufferMinutes = 30;
-                RejExpiryBars     = 30;
+                MinSessionRange   = 150;
+                MaxSessionRange   = 700;
             }
             else if (State == State.DataLoaded)
             {
@@ -230,43 +252,37 @@ private string discordBotToken = "";
             }
         }
 
-        // ─── LOAD NEWS EVENTS ─────────────────────────────
+        // ─── NEWS EVENTS ──────────────────────────────────
         private void LoadNewsEvents()
         {
             newsEvents.Clear();
             LoadHardcodedNews();
-            Print("News events loaded: " + newsEvents.Count);
+            Print("Total news events loaded: " + newsEvents.Count);
         }
 
         private void LoadHardcodedNews()
         {
-            // NFP — first Friday of month 8:30 AM ET
-            int[] nfpYears  = { 2025,2025,2025,2025,2025,2025,2025,2025,2025,2025,2025,2025,
-                                 2026,2026,2026,2026,2026,2026 };
-            int[] nfpMonths = { 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,
-                                 1, 2, 3, 4, 5, 6 };
-            int[] nfpDays   = { 10, 7, 7, 4, 2, 6, 4, 1, 5, 3, 7, 5,
-                                  9, 6, 6, 3, 2, 5 };
+            // NFP — first Friday of month, 8:30 AM ET
+            int[] nfpYears   = { 2025, 2025, 2025, 2025, 2025, 2025, 2025, 2025, 2025, 2025, 2025, 2025,
+                                  2026, 2026, 2026, 2026, 2026, 2026 };
+            int[] nfpMonths  = { 1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 1,  2,  3,  4,  5,  6 };
+            int[] nfpDays    = { 10,  7,  7,  4,  2,  6,  4,  1,  5,  3,  7,  5, 9,  6,  6,  3,  2,  5 };
             for (int i = 0; i < nfpYears.Length; i++)
                 newsEvents.Add(new DateTime(nfpYears[i], nfpMonths[i], nfpDays[i], 8, 30, 0));
 
             // FOMC — 2:00 PM ET
-            int[] fomcYears  = { 2025,2025,2025,2025,2025,2025,2025,2025,
-                                  2026,2026,2026,2026,2026,2026,2026,2026 };
-            int[] fomcMonths = { 1, 3, 5, 6, 7, 9,11,12,
-                                  1, 3, 4, 6, 7, 9,10,12 };
-            int[] fomcDays   = { 29,19, 7,18,30,17, 7,10,
-                                  28,18,29,17,29,16,28, 9 };
+            int[] fomcYears  = { 2025, 2025, 2025, 2025, 2025, 2025, 2025, 2025,
+                                  2026, 2026, 2026, 2026, 2026, 2026, 2026, 2026 };
+            int[] fomcMonths = { 1,  3,  5,  6,  7,  9, 11, 12, 1,  3,  4,  6,  7,  9, 10, 12 };
+            int[] fomcDays   = { 29, 19,  7, 18, 30, 17,  7, 10, 28, 18, 29, 17, 29, 16, 28,  9 };
             for (int i = 0; i < fomcYears.Length; i++)
                 newsEvents.Add(new DateTime(fomcYears[i], fomcMonths[i], fomcDays[i], 14, 0, 0));
 
             // CPI — 8:30 AM ET
-            int[] cpiYears  = { 2025,2025,2025,2025,2025,2025,2025,2025,2025,2025,2025,2025,
-                                 2026,2026,2026,2026,2026,2026 };
-            int[] cpiMonths = { 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,
-                                 1, 2, 3, 4, 5, 6 };
-            int[] cpiDays   = { 15,12,12,10,13,11,15,12,10,15,13,10,
-                                 15,11,11,14,13,11 };
+            int[] cpiYears   = { 2025, 2025, 2025, 2025, 2025, 2025, 2025, 2025, 2025, 2025, 2025, 2025,
+                                  2026, 2026, 2026, 2026, 2026, 2026 };
+            int[] cpiMonths  = { 1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 1,  2,  3,  4,  5,  6 };
+            int[] cpiDays    = { 15, 12, 12, 10, 13, 11, 15, 12, 10, 15, 13, 10, 15, 11, 11, 14, 13, 11 };
             for (int i = 0; i < cpiYears.Length; i++)
                 newsEvents.Add(new DateTime(cpiYears[i], cpiMonths[i], cpiDays[i], 8, 30, 0));
 
@@ -304,27 +320,54 @@ private string discordBotToken = "";
             if (CurrentBar < emaPeriod) return;
             if (evalPassed) return;
 
+            // ── Capture starting balance on first bar ──────
             if (startingBalance == 0)
             {
                 startingBalance = Account.Get(AccountItem.CashValue, Currency.UsDollar);
                 dayStartEquity  = startingBalance;
                 Print(Time[0] + " Starting balance: $" + startingBalance.ToString("F2"));
-                SendDiscordAlert("🚀 RejBlockVwapMNQ STARTED | Balance: $" + startingBalance.ToString("F2"));
+                SendDiscordAlert("STARTED | Balance: $" + startingBalance.ToString("F2"));
             }
 
             int hour   = Time[0].Hour;
             int minute = Time[0].Minute;
 
+            // ── Track running session high/low (RTH only) ─
+            if (hour >= 9 && hour < 16)
+            {
+                if (sessionHigh == 0 || High[0] > sessionHigh) sessionHigh = High[0];
+                if (sessionLow  == 0 || Low[0]  < sessionLow)  sessionLow  = Low[0];
+            }
+
             // ── Reset at session open ──────────────────────
             if (hour == 9 && minute == 30)
             {
+                // Evaluate prior session range before resetting
+                if (sessionHigh > 0)
+                {
+                    prevSessionHigh = sessionHigh;
+                    prevSessionLow  = sessionLow;
+                    double priorRange = prevSessionHigh - prevSessionLow;
+                    bool tooQuiet    = minSessionRange > 0   && priorRange < minSessionRange;
+                    bool tooChaotic  = maxSessionRange < 9999 && priorRange > maxSessionRange;
+                    sessionRangeOk   = !tooQuiet && !tooChaotic;
+                    string rangeStatus = sessionRangeOk ? "TRADE TODAY ✅" : "SKIP TODAY ⛔";
+                    Print(Time[0] + " PRIOR RANGE: " + priorRange.ToString("F1") + " pts | " + rangeStatus
+                        + (tooQuiet   ? " (too quiet <"   + minSessionRange + ")" : "")
+                        + (tooChaotic ? " (too chaotic >" + maxSessionRange + ")" : ""));
+                    SendDiscordAlert("SESSION | Range: " + priorRange.ToString("F0") + "pts | " + rangeStatus);
+                }
+
+                // Reset session tracking
+                sessionHigh = 0;
+                sessionLow  = 0;
+
                 tradedToday    = false;
                 dailyHalted    = false;
                 lastBullishRej = false;
                 lastBearishRej = false;
                 lastRejHigh    = 0;
                 lastRejLow     = 0;
-                lastRejBar     = 0;
                 vwapCumTPVol   = 0;
                 vwapCumVol     = 0;
                 trailActive    = false;
@@ -339,15 +382,8 @@ private string discordBotToken = "";
                 consecHalted   = false;
                 newsHaltActive = false;
 
-                double equity   = Account.Get(AccountItem.CashValue, Currency.UsDollar);
-                double totalPnl = equity - startingBalance;
-                string pnlStr   = (totalPnl >= 0 ? "+$" : "-$") + Math.Abs(totalPnl).ToString("F2");
-                SendDiscordAlert("📅 NEW SESSION | Equity: $" + equity.ToString("F2")
-                    + " | Total PnL: " + pnlStr
-                    + (skipToday ? " | ⚠️ SKIP TODAY ON" : ""));
-
                 if (skipToday)
-                    Print(Time[0] + " SKIP TODAY enabled");
+                    Print(Time[0] + " MANUAL SKIP TODAY enabled");
             }
 
             // ── VWAP accumulation ─────────────────────────
@@ -358,26 +394,35 @@ private string discordBotToken = "";
                 vwapCumVol   += Volume[0];
             }
 
+            // ── Prop firm checks ──────────────────────────
             CheckPropFirmRules();
 
+            // ── Manage open position ──────────────────────
             if (Position.MarketPosition != MarketPosition.Flat)
             {
                 ManagePosition();
                 return;
             }
 
-            if (skipToday) return;
+            // ── All entry gates ───────────────────────────
+            if (skipToday)       return;
+            if (!sessionRangeOk) return;
+            if (dailyHalted)     return;
+            if (evalPassed)      return;
+            if (consecHalted)    return;
+            if (tradedToday)     return;
 
-            bool isLunch = (hour == 12) || (hour == 13 && minute < 30);
-            if (isLunch) return;
+            // ── Lunch hour filter 12:00–13:30 ET ──────────
+            if ((hour == 12) || (hour == 13 && minute < 30)) return;
 
+            // ── News blackout ─────────────────────────────
             if (IsNewsBlackout(Time[0])) return;
 
+            // ── Trading hours ─────────────────────────────
             if (hour < 9 || hour >= 15) return;
-            if (tradedToday || dailyHalted || evalPassed) return;
-            if (consecHalted) return;
-            if (vwapCumVol == 0) return;
-            if (ema == null) return;
+
+            // ── VWAP / EMA ready ──────────────────────────
+            if (vwapCumVol == 0 || ema == null) return;
 
             DetectRejections();
             TryEntry();
@@ -410,7 +455,6 @@ private string discordBotToken = "";
                 lastRejLow     = l;
                 lastBearishRej = true;
                 lastBullishRej = false;
-                lastRejBar     = CurrentBar;
                 Print(Time[0] + " BEARISH REJ h=" + h + " l=" + l);
             }
             if (bullishRej)
@@ -419,32 +463,17 @@ private string discordBotToken = "";
                 lastRejLow     = l;
                 lastBullishRej = true;
                 lastBearishRej = false;
-                lastRejBar     = CurrentBar;
                 Print(Time[0] + " BULLISH REJ h=" + h + " l=" + l);
             }
         }
 
         private void TryEntry()
         {
-            if (vwapCumVol == 0) return;
-            if (ema == null) return;
-
-            // ── Rejection block expiry ────────────────────
-            if (lastRejBar > 0 && (CurrentBar - lastRejBar) > rejExpiryBars)
-            {
-                if (lastBullishRej || lastBearishRej)
-                    Print(Time[0] + " REJ BLOCK EXPIRED after "
-                        + (CurrentBar - lastRejBar) + " bars — invalidated");
-                lastBullishRej = false;
-                lastBearishRej = false;
-                lastRejHigh    = 0;
-                lastRejLow     = 0;
-            }
-
             double vwap   = vwapCumTPVol / vwapCumVol;
             double emaVal = ema[0];
             double c      = Close[0];
 
+            // ── Long entry ────────────────────────────────
             if (lastBullishRej
                 && lastRejLow > 0
                 && c <= lastRejLow * 1.001
@@ -469,14 +498,17 @@ private string discordBotToken = "";
 
                 Print(Time[0] + " LONG entry=" + c.ToString("F2")
                     + " sl=" + sl.ToString("F2")
+                    + " 1R=" + (c + initialRisk).ToString("F2")
                     + " vwap=" + vwap.ToString("F2")
                     + " ema=" + emaVal.ToString("F2"));
 
-                SendDiscordAlert("📈 LONG ENTRY | Price: " + c.ToString("F2")
+                SendDiscordAlert("📈 LONG | " + c.ToString("F2")
                     + " | SL: " + sl.ToString("F2")
-                    + " | Contracts: " + contracts
+                    + " | 1R: " + (c + initialRisk).ToString("F2")
                     + " | " + Time[0].ToString("HH:mm ET"));
             }
+
+            // ── Short entry ───────────────────────────────
             else if (lastBearishRej
                 && lastRejHigh > 0
                 && c >= lastRejHigh * 0.999
@@ -501,12 +533,13 @@ private string discordBotToken = "";
 
                 Print(Time[0] + " SHORT entry=" + c.ToString("F2")
                     + " sl=" + sl.ToString("F2")
+                    + " 1R=" + (c - initialRisk).ToString("F2")
                     + " vwap=" + vwap.ToString("F2")
                     + " ema=" + emaVal.ToString("F2"));
 
-                SendDiscordAlert("📉 SHORT ENTRY | Price: " + c.ToString("F2")
+                SendDiscordAlert("📉 SHORT | " + c.ToString("F2")
                     + " | SL: " + sl.ToString("F2")
-                    + " | Contracts: " + contracts
+                    + " | 1R: " + (c - initialRisk).ToString("F2")
                     + " | " + Time[0].ToString("HH:mm ET"));
             }
         }
@@ -520,6 +553,7 @@ private string discordBotToken = "";
                 if (High[0] > highWaterMark)
                     highWaterMark = High[0];
 
+                // ── Partial TP at 1R ──────────────────────
                 if (!partialTaken && initialRisk > 0
                     && c >= entryPrice + initialRisk
                     && Position.Quantity > 1)
@@ -527,11 +561,12 @@ private string discordBotToken = "";
                     ExitLong(1, "Partial TP", "RB Long");
                     partialTaken = true;
                     stopPrice    = entryPrice;
-                    Print(Time[0] + " PARTIAL TP long @ " + c.ToString("F2"));
-                    SendDiscordAlert("✂️ PARTIAL TP LONG | Price: " + c.ToString("F2")
+                    Print(Time[0] + " PARTIAL TP long @ " + c.ToString("F2") + " stop→BE");
+                    SendDiscordAlert("✂️ PARTIAL TP LONG | " + c.ToString("F2")
                         + " | Stop → BE: " + entryPrice.ToString("F2"));
                 }
 
+                // ── Trail ─────────────────────────────────
                 double profitPts = highWaterMark - entryPrice;
                 if (profitPts >= trailActivation && !trailActive)
                 {
@@ -544,15 +579,17 @@ private string discordBotToken = "";
                     if (newStop > stopPrice) stopPrice = newStop;
                 }
 
+                // ── Exit ──────────────────────────────────
                 if (c <= stopPrice)
                 {
                     double pnl      = (c - entryPrice) * Position.Quantity * 2;
                     string exitType = trailActive ? "TRAIL EXIT" : "STOP LOSS";
                     UpdateConsecLosses(pnl);
                     ExitLong("SL", "RB Long");
-                    Print(Time[0] + " " + exitType + " long @ " + c.ToString("F2"));
-                    SendDiscordAlert((pnl >= 0 ? "✅" : "❌") + " LONG CLOSED (" + exitType + ")"
-                        + " | Exit: " + c.ToString("F2")
+                    Print(Time[0] + " " + exitType + " long @ " + c.ToString("F2")
+                        + " PnL=" + pnl.ToString("F2"));
+                    SendDiscordAlert((pnl >= 0 ? "✅" : "❌") + " LONG (" + exitType + ")"
+                        + " | " + c.ToString("F2")
                         + " | PnL: " + (pnl >= 0 ? "+$" : "-$") + Math.Abs(pnl).ToString("F2"));
                     tradeSide    = "";
                     partialTaken = false;
@@ -563,6 +600,7 @@ private string discordBotToken = "";
                 if (Low[0] < lowWaterMark || lowWaterMark == 0)
                     lowWaterMark = Low[0];
 
+                // ── Partial TP at 1R ──────────────────────
                 if (!partialTaken && initialRisk > 0
                     && c <= entryPrice - initialRisk
                     && Position.Quantity > 1)
@@ -570,11 +608,12 @@ private string discordBotToken = "";
                     ExitShort(1, "Partial TP", "RB Short");
                     partialTaken = true;
                     stopPrice    = entryPrice;
-                    Print(Time[0] + " PARTIAL TP short @ " + c.ToString("F2"));
-                    SendDiscordAlert("✂️ PARTIAL TP SHORT | Price: " + c.ToString("F2")
+                    Print(Time[0] + " PARTIAL TP short @ " + c.ToString("F2") + " stop→BE");
+                    SendDiscordAlert("✂️ PARTIAL TP SHORT | " + c.ToString("F2")
                         + " | Stop → BE: " + entryPrice.ToString("F2"));
                 }
 
+                // ── Trail ─────────────────────────────────
                 double profitPts = entryPrice - lowWaterMark;
                 if (profitPts >= trailActivation && !trailActive)
                 {
@@ -587,15 +626,17 @@ private string discordBotToken = "";
                     if (newStop < stopPrice) stopPrice = newStop;
                 }
 
+                // ── Exit ──────────────────────────────────
                 if (c >= stopPrice)
                 {
                     double pnl      = (entryPrice - c) * Position.Quantity * 2;
                     string exitType = trailActive ? "TRAIL EXIT" : "STOP LOSS";
                     UpdateConsecLosses(pnl);
                     ExitShort("SL", "RB Short");
-                    Print(Time[0] + " " + exitType + " short @ " + c.ToString("F2"));
-                    SendDiscordAlert((pnl >= 0 ? "✅" : "❌") + " SHORT CLOSED (" + exitType + ")"
-                        + " | Exit: " + c.ToString("F2")
+                    Print(Time[0] + " " + exitType + " short @ " + c.ToString("F2")
+                        + " PnL=" + pnl.ToString("F2"));
+                    SendDiscordAlert((pnl >= 0 ? "✅" : "❌") + " SHORT (" + exitType + ")"
+                        + " | " + c.ToString("F2")
                         + " | PnL: " + (pnl >= 0 ? "+$" : "-$") + Math.Abs(pnl).ToString("F2"));
                     tradeSide    = "";
                     partialTaken = false;
@@ -619,8 +660,7 @@ private string discordBotToken = "";
                 {
                     consecHalted = true;
                     Print(Time[0] + " CONSEC LOSS HALT");
-                    SendDiscordAlert("⛔ CONSEC LOSS HALT | " + consecLosses
-                        + " consecutive losses — paused for today");
+                    SendDiscordAlert("⛔ CONSEC HALT | " + consecLosses + " consecutive losses");
                 }
             }
         }
@@ -633,17 +673,19 @@ private string discordBotToken = "";
             todayProfit   = equity - dayStartEquity;
             totalProfit   = equity - startingBalance;
 
+            // ── Eval passed ───────────────────────────────
             if (totalProfit >= profitTarget && !evalPassed)
             {
                 evalPassed = true;
                 ExitLong("Eval Passed", "RB Long");
                 ExitShort("Eval Passed", "RB Short");
                 Print(Time[0] + " EVAL PASSED $" + totalProfit.ToString("F2"));
-                SendDiscordAlert("🏆 EVAL PASSED! Profit: $" + totalProfit.ToString("F2")
-                    + " | CHECK YOUR LUCID ACCOUNT NOW!");
+                SendDiscordAlert("🏆 EVAL PASSED! Total: +$" + totalProfit.ToString("F2")
+                    + " | CHECK LUCID ACCOUNT NOW!");
                 return;
             }
 
+            // ── Drawdown halt ─────────────────────────────
             double drawdown = startingBalance - equity;
             if (drawdown >= maxDrawdown && !dailyHalted)
             {
@@ -651,19 +693,22 @@ private string discordBotToken = "";
                 ExitLong("DD Halt", "RB Long");
                 ExitShort("DD Halt", "RB Short");
                 Print(Time[0] + " DRAWDOWN HALT $" + drawdown.ToString("F2"));
-                SendDiscordAlert("🚨 DRAWDOWN HALT | Loss: $" + drawdown.ToString("F2")
-                    + " | Limit: $" + maxDrawdown.ToString("F2")
-                    + " | All positions closed.");
+                SendDiscordAlert("🚨 DRAWDOWN HALT | -$" + drawdown.ToString("F2")
+                    + " | Limit: $" + maxDrawdown.ToString("F2"));
                 return;
             }
 
-       if (!dailyHalted && todayProfit >= 1200)
+            // ── Daily profit cap ──────────────────────────
+            // Stop trading once today's profit >= $1,200 — lock in the good day
+            if (todayProfit >= dailyProfitCap && !dailyHalted)
             {
                 dailyHalted = true;
-                ExitLong("Consistency Halt", "RB Long");
-                ExitShort("Consistency Halt", "RB Short");
-                Print(Time[0] + " CONSISTENCY HALT — today $" + todayProfit.ToString("F2") + " >= $1200 limit");
-                SendDiscordAlert("⚠️ CONSISTENCY HALT | Today: +$" + todayProfit.ToString("F2") + " | Lucid $1200/day limit hit");
+                ExitLong("Daily Cap", "RB Long");
+                ExitShort("Daily Cap", "RB Short");
+                Print(Time[0] + " DAILY PROFIT CAP HIT $" + todayProfit.ToString("F2"));
+                SendDiscordAlert("💰 DAILY CAP HIT | Today: +$" + todayProfit.ToString("F2")
+                    + " | Done for the day ✅");
+                return;
             }
         }
     }
