@@ -11,13 +11,14 @@
 // ║    7. Session range filter: skip if prior RTH range < 150 or    ║
 // ║       > 700 pts                                                  ║
 // ║    8. Daily profit cap: stop trading if today profit >= $1,200   ║
+// ║    9. Rejection expiry: discard blocks older than 30 bars        ║
 // ║                                                                  ║
-// ║  Confirmed baselines (1-min bars, slippage=2, commission on):   ║
-// ║    PF 1.77 → Jun 2025–Apr 2026 WITH session range filter        ║
-// ║    PF 1.77 → Jan 2025–Apr 2026 WITH session range filter        ║
+// ║  Confirmed baseline (1-min bars, slippage=2, commission on):    ║
+// ║    PF 1.77 → Jun 2025–Apr 2026 (all filters active incl expiry) ║
+// ║    PF 1.77 → Jan 2025–Apr 2026 (all filters active incl expiry) ║
 // ║                                                                  ║
 // ║  Optimal params: WickRatio=2, SlBuffer=3, TrailActivation=120,  ║
-// ║                  TrailOffset=25, EmaPeriod=40                    ║
+// ║                  TrailOffset=25, EmaPeriod=40, RejExpiryBars=30  ║
 // ║  Session range: MinSessionRange=150, MaxSessionRange=700         ║
 // ╚══════════════════════════════════════════════════════════════════╝
 
@@ -112,6 +113,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             set { maxSessionRange = Math.Max(0, value); }
         }
 
+        // ─── REJECTION EXPIRY ─────────────────────────────
+        // Reject stale blocks older than this many bars. Confirmed part of 1.77 baseline.
+        [NinjaScriptProperty]
+        public int RejExpiryBars
+        {
+            get { return rejExpiryBars; }
+            set { rejExpiryBars = Math.Max(1, value); }
+        }
+
         // ─── PARAMETERS ───────────────────────────────────
         private double wickRatio         = 2.0;
         private double slBuffer          = 3;
@@ -128,6 +138,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int    newsBufferMinutes = 30;
         private double minSessionRange   = 150;    // proven optimal
         private double maxSessionRange   = 700;    // cap chaotic high-slippage days
+        private int    rejExpiryBars     = 30;     // confirmed part of 1.77 baseline
 
         // ─── INDICATORS ───────────────────────────────────
         private EMA ema;
@@ -140,6 +151,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool   lastBearishRej = false;
         private double lastRejHigh    = 0;
         private double lastRejLow     = 0;
+        private int    lastRejBar     = 0;     // tracks bar index of last rejection
 
         // ─── CONSECUTIVE LOSS TRACKING ────────────────────
         private int    consecLosses   = 0;
@@ -241,6 +253,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 NewsBufferMinutes = 30;
                 MinSessionRange   = 150;
                 MaxSessionRange   = 700;
+                RejExpiryBars     = 30;
             }
             else if (State == State.DataLoaded)
             {
@@ -368,6 +381,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lastBearishRej = false;
                 lastRejHigh    = 0;
                 lastRejLow     = 0;
+                lastRejBar     = 0;
                 vwapCumTPVol   = 0;
                 vwapCumVol     = 0;
                 trailActive    = false;
@@ -455,6 +469,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lastRejLow     = l;
                 lastBearishRej = true;
                 lastBullishRej = false;
+                lastRejBar     = CurrentBar;
                 Print(Time[0] + " BEARISH REJ h=" + h + " l=" + l);
             }
             if (bullishRej)
@@ -463,12 +478,25 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lastRejLow     = l;
                 lastBullishRej = true;
                 lastBearishRej = false;
+                lastRejBar     = CurrentBar;
                 Print(Time[0] + " BULLISH REJ h=" + h + " l=" + l);
             }
         }
 
         private void TryEntry()
         {
+            // ── Reject stale blocks ───────────────────────
+            if (lastRejBar > 0 && (CurrentBar - lastRejBar) > rejExpiryBars)
+            {
+                lastBullishRej = false;
+                lastBearishRej = false;
+                lastRejHigh    = 0;
+                lastRejLow     = 0;
+                lastRejBar     = 0;
+                Print(Time[0] + " REJ EXPIRED after " + rejExpiryBars + " bars");
+                return;
+            }
+
             double vwap   = vwapCumTPVol / vwapCumVol;
             double emaVal = ema[0];
             double c      = Close[0];
