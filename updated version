@@ -20,6 +20,14 @@
 // ║  Optimal params: WickRatio=2, SlBuffer=3, TrailActivation=120,  ║
 // ║                  TrailOffset=25, EmaPeriod=40, RejExpiryBars=30  ║
 // ║  Session range: MinSessionRange=150, MaxSessionRange=700         ║
+// ║                                                                  ║
+// ║  AUDIT FIXES (2026-05):                                          ║
+// ║    FIX 1 — ManagePosition() uses Position.AveragePrice for all  ║
+// ║             post-fill logic (partial TP, trail, stop exit PnL)  ║
+// ║    FIX 2 — tradedToday moved to OnExecutionUpdate on fill        ║
+// ║    FIX 3 — partialPnl tracked separately; Discord shows total    ║
+// ║             trade PnL (partial leg + remaining leg combined)     ║
+// ║    FIX 4 — lowWaterMark initialized to entryPrice at short entry ║
 // ╚══════════════════════════════════════════════════════════════════╝
 
 using System;
@@ -97,8 +105,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // ─── SESSION RANGE FILTER ─────────────────────────
-        // Skip today if prior RTH range < Min (too quiet/trending)
-        // Skip today if prior RTH range > Max (too chaotic, wide slippage)
         [NinjaScriptProperty]
         public double MinSessionRange
         {
@@ -114,7 +120,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // ─── REJECTION EXPIRY ─────────────────────────────
-        // Reject stale blocks older than this many bars. Confirmed part of 1.77 baseline.
         [NinjaScriptProperty]
         public int RejExpiryBars
         {
@@ -136,9 +141,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double dailyProfitCap    = 1200;   // stop trading once today's profit >= this
         private bool   skipToday         = false;
         private int    newsBufferMinutes = 30;
-        private double minSessionRange   = 150;    // proven optimal
-        private double maxSessionRange   = 700;    // cap chaotic high-slippage days
-        private int    rejExpiryBars     = 30;     // confirmed part of 1.77 baseline
+        private double minSessionRange   = 150;
+        private double maxSessionRange   = 700;
+        private int    rejExpiryBars     = 30;
 
         // ─── INDICATORS ───────────────────────────────────
         private EMA ema;
@@ -151,7 +156,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool   lastBearishRej = false;
         private double lastRejHigh    = 0;
         private double lastRejLow     = 0;
-        private int    lastRejBar     = 0;     // tracks bar index of last rejection
+        private int    lastRejBar     = 0;
 
         // ─── CONSECUTIVE LOSS TRACKING ────────────────────
         private int    consecLosses   = 0;
@@ -173,13 +178,17 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // ─── POSITION STATE ───────────────────────────────
         private double stopPrice     = 0;
-        private double entryPrice    = 0;
+        private double entryPrice    = 0;   // estimated at order submission — used for stop sizing only
         private double highWaterMark = 0;
         private double lowWaterMark  = 0;
         private bool   trailActive   = false;
         private bool   partialTaken  = false;
         private string tradeSide     = "";
         private double initialRisk   = 0;
+
+        // FIX 3 — tracks realized PnL from partial TP leg
+        // so final exit Discord alert can show total trade PnL
+        private double partialPnl    = 0;
 
         // ─── SESSION RANGE TRACKING ───────────────────────
         private double sessionHigh     = 0;
@@ -361,7 +370,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     prevSessionHigh = sessionHigh;
                     prevSessionLow  = sessionLow;
                     double priorRange = prevSessionHigh - prevSessionLow;
-                    bool tooQuiet    = minSessionRange > 0   && priorRange < minSessionRange;
+                    bool tooQuiet    = minSessionRange > 0    && priorRange < minSessionRange;
                     bool tooChaotic  = maxSessionRange < 9999 && priorRange > maxSessionRange;
                     sessionRangeOk   = !tooQuiet && !tooChaotic;
                     string rangeStatus = sessionRangeOk ? "TRADE TODAY ✅" : "SKIP TODAY ⛔";
@@ -375,6 +384,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 sessionHigh = 0;
                 sessionLow  = 0;
 
+                // FIX 2 — tradedToday is now set in OnExecutionUpdate on actual fill,
+                // so we only reset it here at session open (no change needed here)
                 tradedToday    = false;
                 dailyHalted    = false;
                 lastBullishRej = false;
@@ -386,6 +397,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 vwapCumVol     = 0;
                 trailActive    = false;
                 partialTaken   = false;
+                partialPnl     = 0;     // FIX 3 — reset partial PnL tracker at session open
                 highWaterMark  = 0;
                 lowWaterMark   = 0;
                 tradeSide      = "";
@@ -440,6 +452,29 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             DetectRejections();
             TryEntry();
+        }
+
+        // ─── FIX 2 — tradedToday set on confirmed fill ────
+        // Prevents silent day lockout if order is rejected by broker.
+        // tradedToday = true is no longer set in TryEntry().
+        protected override void OnExecutionUpdate(
+            Execution execution,
+            string executionId,
+            double price,
+            int quantity,
+            MarketPosition marketPosition,
+            string orderId,
+            DateTime time)
+        {
+            if (execution.Order == null) return;
+            if (execution.Order.OrderState != OrderState.Filled) return;
+
+            if (execution.Order.Name == "RB Long" || execution.Order.Name == "RB Short")
+            {
+                tradedToday = true;
+                Print(time + " FILL CONFIRMED — tradedToday set | " + execution.Order.Name
+                    + " @ " + price.ToString("F2") + " x" + quantity);
+            }
         }
 
         private void DetectRejections()
@@ -513,16 +548,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (riskDollars > maxLossDollars)
                     sl = c - (maxLossDollars / (contracts * 2));
 
+                // entryPrice here is a bar-close estimate used only for stop sizing.
+                // All post-fill logic in ManagePosition() uses Position.AveragePrice. (FIX 1)
                 stopPrice     = sl;
                 entryPrice    = c;
                 initialRisk   = c - sl;
                 highWaterMark = c;
                 trailActive   = false;
                 partialTaken  = false;
+                partialPnl    = 0;    // FIX 3 — reset before new trade
                 tradeSide     = "long";
 
+                // FIX 2 — tradedToday is now set in OnExecutionUpdate on confirmed fill
                 EnterLong(contracts, "RB Long");
-                tradedToday = true;
 
                 Print(Time[0] + " LONG entry=" + c.ToString("F2")
                     + " sl=" + sl.ToString("F2")
@@ -551,13 +589,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                 stopPrice    = sl;
                 entryPrice   = c;
                 initialRisk  = sl - c;
+                // FIX 4 — initialize lowWaterMark to entryPrice, not 0
                 lowWaterMark = c;
                 trailActive  = false;
                 partialTaken = false;
+                partialPnl   = 0;    // FIX 3 — reset before new trade
                 tradeSide    = "short";
 
+                // FIX 2 — tradedToday is now set in OnExecutionUpdate on confirmed fill
                 EnterShort(contracts, "RB Short");
-                tradedToday = true;
 
                 Print(Time[0] + " SHORT entry=" + c.ToString("F2")
                     + " sl=" + sl.ToString("F2")
@@ -576,26 +616,34 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             double c = Close[0];
 
+            // ── FIX 1 — use actual fill price for all post-fill logic ──
+            // Position.AveragePrice reflects the real fill, not bar close estimate.
+            // entryPrice (set in TryEntry) is only used for initial stop sizing.
+            double fillPrice = Position.AveragePrice;
+
             if (tradeSide == "long")
             {
                 if (High[0] > highWaterMark)
                     highWaterMark = High[0];
 
-                // ── Partial TP at 1R ──────────────────────
+                // ── Partial TP at 1R (using fill price) ──────────────
                 if (!partialTaken && initialRisk > 0
-                    && c >= entryPrice + initialRisk
+                    && c >= fillPrice + initialRisk
                     && Position.Quantity > 1)
                 {
+                    // FIX 3 — record partial leg PnL before exit
+                    partialPnl = (fillPrice + initialRisk - fillPrice) * 1 * 2;  // = initialRisk * 2
                     ExitLong(1, "Partial TP", "RB Long");
                     partialTaken = true;
-                    stopPrice    = entryPrice;
-                    Print(Time[0] + " PARTIAL TP long @ " + c.ToString("F2") + " stop→BE");
+                    stopPrice    = fillPrice;  // FIX 1 — breakeven uses fill price, not bar close estimate
+                    Print(Time[0] + " PARTIAL TP long @ " + c.ToString("F2")
+                        + " stop→BE fill=" + fillPrice.ToString("F2"));
                     SendDiscordAlert("✂️ PARTIAL TP LONG | " + c.ToString("F2")
-                        + " | Stop → BE: " + entryPrice.ToString("F2"));
+                        + " | Stop → BE: " + fillPrice.ToString("F2"));
                 }
 
-                // ── Trail ─────────────────────────────────
-                double profitPts = highWaterMark - entryPrice;
+                // ── Trail (using fill price for activation) ───────────
+                double profitPts = highWaterMark - fillPrice;
                 if (profitPts >= trailActivation && !trailActive)
                 {
                     trailActive = true;
@@ -607,42 +655,51 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (newStop > stopPrice) stopPrice = newStop;
                 }
 
-                // ── Exit ──────────────────────────────────
+                // ── Exit (PnL uses fill price and remaining quantity) ──
                 if (c <= stopPrice)
                 {
-                    double pnl      = (c - entryPrice) * Position.Quantity * 2;
-                    string exitType = trailActive ? "TRAIL EXIT" : "STOP LOSS";
-                    UpdateConsecLosses(pnl);
+                    // FIX 3 — total trade PnL = partial leg + remaining leg
+                    double remainPnl    = (c - fillPrice) * Position.Quantity * 2;
+                    double totalTradePnl = partialPnl + remainPnl;
+                    string exitType     = trailActive ? "TRAIL EXIT" : "STOP LOSS";
+                    UpdateConsecLosses(totalTradePnl);
                     ExitLong("SL", "RB Long");
                     Print(Time[0] + " " + exitType + " long @ " + c.ToString("F2")
-                        + " PnL=" + pnl.ToString("F2"));
-                    SendDiscordAlert((pnl >= 0 ? "✅" : "❌") + " LONG (" + exitType + ")"
+                        + " fillPrice=" + fillPrice.ToString("F2")
+                        + " PnL=" + totalTradePnl.ToString("F2"));
+                    SendDiscordAlert((totalTradePnl >= 0 ? "✅" : "❌") + " LONG (" + exitType + ")"
                         + " | " + c.ToString("F2")
-                        + " | PnL: " + (pnl >= 0 ? "+$" : "-$") + Math.Abs(pnl).ToString("F2"));
+                        + " | PnL: " + (totalTradePnl >= 0 ? "+$" : "-$") + Math.Abs(totalTradePnl).ToString("F2"));
                     tradeSide    = "";
                     partialTaken = false;
+                    partialPnl   = 0;   // FIX 3 — reset after trade closed
                 }
             }
             else if (tradeSide == "short")
             {
+                // FIX 4 — lowWaterMark is now initialized to entryPrice in TryEntry(),
+                // so this guard is no longer needed, but kept for safety
                 if (Low[0] < lowWaterMark || lowWaterMark == 0)
                     lowWaterMark = Low[0];
 
-                // ── Partial TP at 1R ──────────────────────
+                // ── Partial TP at 1R (using fill price) ──────────────
                 if (!partialTaken && initialRisk > 0
-                    && c <= entryPrice - initialRisk
+                    && c <= fillPrice - initialRisk
                     && Position.Quantity > 1)
                 {
+                    // FIX 3 — record partial leg PnL before exit
+                    partialPnl = initialRisk * 1 * 2;  // short partial: initialRisk pts profit * $2/pt * 1 contract
                     ExitShort(1, "Partial TP", "RB Short");
                     partialTaken = true;
-                    stopPrice    = entryPrice;
-                    Print(Time[0] + " PARTIAL TP short @ " + c.ToString("F2") + " stop→BE");
+                    stopPrice    = fillPrice;  // FIX 1 — breakeven uses fill price
+                    Print(Time[0] + " PARTIAL TP short @ " + c.ToString("F2")
+                        + " stop→BE fill=" + fillPrice.ToString("F2"));
                     SendDiscordAlert("✂️ PARTIAL TP SHORT | " + c.ToString("F2")
-                        + " | Stop → BE: " + entryPrice.ToString("F2"));
+                        + " | Stop → BE: " + fillPrice.ToString("F2"));
                 }
 
-                // ── Trail ─────────────────────────────────
-                double profitPts = entryPrice - lowWaterMark;
+                // ── Trail (using fill price for activation) ───────────
+                double profitPts = fillPrice - lowWaterMark;
                 if (profitPts >= trailActivation && !trailActive)
                 {
                     trailActive = true;
@@ -654,20 +711,24 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (newStop < stopPrice) stopPrice = newStop;
                 }
 
-                // ── Exit ──────────────────────────────────
+                // ── Exit (PnL uses fill price and remaining quantity) ──
                 if (c >= stopPrice)
                 {
-                    double pnl      = (entryPrice - c) * Position.Quantity * 2;
-                    string exitType = trailActive ? "TRAIL EXIT" : "STOP LOSS";
-                    UpdateConsecLosses(pnl);
+                    // FIX 3 — total trade PnL = partial leg + remaining leg
+                    double remainPnl     = (fillPrice - c) * Position.Quantity * 2;
+                    double totalTradePnl = partialPnl + remainPnl;
+                    string exitType      = trailActive ? "TRAIL EXIT" : "STOP LOSS";
+                    UpdateConsecLosses(totalTradePnl);
                     ExitShort("SL", "RB Short");
                     Print(Time[0] + " " + exitType + " short @ " + c.ToString("F2")
-                        + " PnL=" + pnl.ToString("F2"));
-                    SendDiscordAlert((pnl >= 0 ? "✅" : "❌") + " SHORT (" + exitType + ")"
+                        + " fillPrice=" + fillPrice.ToString("F2")
+                        + " PnL=" + totalTradePnl.ToString("F2"));
+                    SendDiscordAlert((totalTradePnl >= 0 ? "✅" : "❌") + " SHORT (" + exitType + ")"
                         + " | " + c.ToString("F2")
-                        + " | PnL: " + (pnl >= 0 ? "+$" : "-$") + Math.Abs(pnl).ToString("F2"));
+                        + " | PnL: " + (totalTradePnl >= 0 ? "+$" : "-$") + Math.Abs(totalTradePnl).ToString("F2"));
                     tradeSide    = "";
                     partialTaken = false;
+                    partialPnl   = 0;   // FIX 3 — reset after trade closed
                 }
             }
         }
@@ -727,7 +788,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             // ── Daily profit cap ──────────────────────────
-            // Stop trading once today's profit >= $1,200 — lock in the good day
             if (todayProfit >= dailyProfitCap && !dailyHalted)
             {
                 dailyHalted = true;
