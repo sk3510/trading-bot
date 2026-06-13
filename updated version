@@ -11,14 +11,13 @@
 // ║    7. Session range filter: skip if prior RTH range < 150 or    ║
 // ║       > 700 pts                                                  ║
 // ║    8. Daily profit cap: stop trading if today profit >= $1,200   ║
-// ║    9. Rejection expiry: discard blocks older than 30 bars        ║
 // ║                                                                  ║
 // ║  Confirmed baseline (1-min bars, slippage=2, commission on):    ║
-// ║    PF 1.77 → Jun 2025–Apr 2026 (all filters active incl expiry) ║
-// ║    PF 1.77 → Jan 2025–Apr 2026 (all filters active incl expiry) ║
+// ║    PF 1.77 → Jun 2025–Apr 2026                                  ║
+// ║    PF 1.77 → Jan 2025–Apr 2026                                  ║
 // ║                                                                  ║
 // ║  Optimal params: WickRatio=2, SlBuffer=3, TrailActivation=120,  ║
-// ║                  TrailOffset=25, EmaPeriod=40, RejExpiryBars=30  ║
+// ║                  TrailOffset=25, EmaPeriod=40                    ║
 // ║  Session range: MinSessionRange=150, MaxSessionRange=700         ║
 // ║                                                                  ║
 // ║  AUDIT FIXES (2026-05):                                          ║
@@ -28,6 +27,13 @@
 // ║    FIX 3 — partialPnl tracked separately; Discord shows total    ║
 // ║             trade PnL (partial leg + remaining leg combined)     ║
 // ║    FIX 4 — lowWaterMark initialized to entryPrice at short entry ║
+// ║                                                                  ║
+// ║  CHANGE (2026-06):                                               ║
+// ║    - Rejection expiry REMOVED (testing: expiry hurt; plateau     ║
+// ║      flat from ~190 to 600 bars — bar-count expiry not an edge). ║
+// ║    - Profit target non-terminal by default (StopAtProfitTarget): ║
+// ║      live rolls into the funded stage and keeps trading past     ║
+// ║      $3,000. Set StopAtProfitTarget=true to measure eval pass.   ║
 // ╚══════════════════════════════════════════════════════════════════╝
 
 using System;
@@ -119,12 +125,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             set { maxSessionRange = Math.Max(0, value); }
         }
 
-        // ─── REJECTION EXPIRY ─────────────────────────────
+        // ─── PROFIT TARGET BEHAVIOR ───────────────────────
+        // false (default, LIVE): hitting $3,000 alerts but KEEPS TRADING — the
+        //   account rolls into the funded stage, which has no profit ceiling.
+        // true (BACKTEST): stop at $3,000 to measure eval pass like before.
         [NinjaScriptProperty]
-        public int RejExpiryBars
+        public bool StopAtProfitTarget
         {
-            get { return rejExpiryBars; }
-            set { rejExpiryBars = Math.Max(1, value); }
+            get { return stopAtProfitTarget; }
+            set { stopAtProfitTarget = value; }
         }
 
         // ─── PARAMETERS ───────────────────────────────────
@@ -143,7 +152,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int    newsBufferMinutes = 30;
         private double minSessionRange   = 150;
         private double maxSessionRange   = 700;
-        private int    rejExpiryBars     = 30;
+        private bool   stopAtProfitTarget = false; // false = funded stage (keep trading past target)
 
         // ─── INDICATORS ───────────────────────────────────
         private EMA ema;
@@ -151,12 +160,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ─── SESSION STATE ────────────────────────────────
         private bool   tradedToday    = false;
         private bool   evalPassed     = false;
+        private bool   targetReached  = false;   // latches once total profit >= target (alert dedupe)
         private bool   dailyHalted    = false;
         private bool   lastBullishRej = false;
         private bool   lastBearishRej = false;
         private double lastRejHigh    = 0;
         private double lastRejLow     = 0;
-        private int    lastRejBar     = 0;
 
         // ─── CONSECUTIVE LOSS TRACKING ────────────────────
         private int    consecLosses   = 0;
@@ -262,7 +271,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 NewsBufferMinutes = 30;
                 MinSessionRange   = 150;
                 MaxSessionRange   = 700;
-                RejExpiryBars     = 30;
+                StopAtProfitTarget = false;
             }
             else if (State == State.DataLoaded)
             {
@@ -392,7 +401,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lastBearishRej = false;
                 lastRejHigh    = 0;
                 lastRejLow     = 0;
-                lastRejBar     = 0;
                 vwapCumTPVol   = 0;
                 vwapCumVol     = 0;
                 trailActive    = false;
@@ -504,7 +512,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lastRejLow     = l;
                 lastBearishRej = true;
                 lastBullishRej = false;
-                lastRejBar     = CurrentBar;
                 Print(Time[0] + " BEARISH REJ h=" + h + " l=" + l);
             }
             if (bullishRej)
@@ -513,25 +520,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lastRejLow     = l;
                 lastBullishRej = true;
                 lastBearishRej = false;
-                lastRejBar     = CurrentBar;
                 Print(Time[0] + " BULLISH REJ h=" + h + " l=" + l);
             }
         }
 
         private void TryEntry()
         {
-            // ── Reject stale blocks ───────────────────────
-            if (lastRejBar > 0 && (CurrentBar - lastRejBar) > rejExpiryBars)
-            {
-                lastBullishRej = false;
-                lastBearishRej = false;
-                lastRejHigh    = 0;
-                lastRejLow     = 0;
-                lastRejBar     = 0;
-                Print(Time[0] + " REJ EXPIRED after " + rejExpiryBars + " bars");
-                return;
-            }
-
             double vwap   = vwapCumTPVol / vwapCumVol;
             double emaVal = ema[0];
             double c      = Close[0];
@@ -762,16 +756,24 @@ namespace NinjaTrader.NinjaScript.Strategies
             todayProfit   = equity - dayStartEquity;
             totalProfit   = equity - startingBalance;
 
-            // ── Eval passed ───────────────────────────────
-            if (totalProfit >= profitTarget && !evalPassed)
+            // ── Profit target reached ─────────────────────
+            // Alert once. If StopAtProfitTarget (backtest) → flatten and halt to
+            // measure eval pass. If false (LIVE/funded) → keep trading past target.
+            if (totalProfit >= profitTarget && !targetReached)
             {
-                evalPassed = true;
-                ExitLong("Eval Passed", "RB Long");
-                ExitShort("Eval Passed", "RB Short");
-                Print(Time[0] + " EVAL PASSED $" + totalProfit.ToString("F2"));
-                SendDiscordAlert("🏆 EVAL PASSED! Total: +$" + totalProfit.ToString("F2")
-                    + " | CHECK LUCID ACCOUNT NOW!");
-                return;
+                targetReached = true;
+                Print(Time[0] + " PROFIT TARGET REACHED $" + totalProfit.ToString("F2"));
+                if (stopAtProfitTarget)
+                {
+                    evalPassed = true;
+                    ExitLong("Eval Passed", "RB Long");
+                    ExitShort("Eval Passed", "RB Short");
+                    SendDiscordAlert("🏆 EVAL PASSED! Total: +$" + totalProfit.ToString("F2")
+                        + " | CHECK LUCID ACCOUNT NOW!");
+                    return;
+                }
+                SendDiscordAlert("🏆 PROFIT TARGET HIT (+$" + totalProfit.ToString("F2")
+                    + ")! Funded stage — bot KEEPS TRADING. Check Lucid.");
             }
 
             // ── Drawdown halt ─────────────────────────────
