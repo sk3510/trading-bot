@@ -1,5 +1,5 @@
 // ╔══════════════════════════════════════════════════════════════════╗
-// ║              RejBlockVwapMNQ — LIVE STRATEGY                    ║
+// ║   RejBlockVwapMNQ — LIVE (corrected news calendar + day-skip)   ║
 // ║                                                                  ║
 // ║  Filters active:                                                 ║
 // ║    1. Lunch filter: skip 12:00–13:30 ET                         ║
@@ -125,6 +125,17 @@ namespace NinjaTrader.NinjaScript.Strategies
             set { maxSessionRange = Math.Max(0, value); }
         }
 
+        // ─── Skip the ENTIRE day on any scheduled-news day (NFP/CPI/FOMC) ──
+        // OFF (default) = ±buffer window only. ON = no entries on any news day.
+        // This is the validated tail-protector (removes the CPI-day disaster).
+        // Only as good as the date list below — keep FOMC/CPI current.
+        [NinjaScriptProperty]
+        public bool SkipNewsDayEntirely
+        {
+            get { return skipNewsDayEntirely; }
+            set { skipNewsDayEntirely = value; }
+        }
+
         // ─── PROFIT TARGET BEHAVIOR ───────────────────────
         // false (default, LIVE): hitting $3,000 alerts but KEEPS TRADING — the
         //   account rolls into the funded stage, which has no profit ceiling.
@@ -153,6 +164,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double minSessionRange   = 150;
         private double maxSessionRange   = 700;
         private bool   stopAtProfitTarget = false; // false = funded stage (keep trading past target)
+        private bool   skipNewsDayEntirely = true;  // ON = validated config (skip scheduled-news days)
 
         // ─── INDICATORS ───────────────────────────────────
         private EMA ema;
@@ -272,6 +284,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 MinSessionRange   = 150;
                 MaxSessionRange   = 700;
                 StopAtProfitTarget = false;
+                SkipNewsDayEntirely = true;
             }
             else if (State == State.DataLoaded)
             {
@@ -287,37 +300,63 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void LoadNewsEvents()
         {
             newsEvents.Clear();
-            LoadHardcodedNews();
-            Print("Total news events loaded: " + newsEvents.Count);
+            LoadFomcDates();      // verified 2:00 PM ET decision days, 2023-2027
+            LoadCpiDates();       // verified 8:30 AM ET CPI releases, 2025-2026
+            LoadComputedNfp();    // first Friday of month, computed (self-maintaining)
+            Print("News events loaded: " + newsEvents.Count);
         }
 
-        private void LoadHardcodedNews()
+        // FOMC decision days (2:00 PM ET) — verified vs federalreserve.gov, 2023-2027.
+        // The ONLY scheduled event inside the 9:30-15:00 session, so the ±buffer
+        // blackout effectively only bites here. EXTEND past 2027 each year.
+        private void LoadFomcDates()
         {
-            // NFP — first Friday of month, 8:30 AM ET
-            int[] nfpYears   = { 2025, 2025, 2025, 2025, 2025, 2025, 2025, 2025, 2025, 2025, 2025, 2025,
-                                  2026, 2026, 2026, 2026, 2026, 2026 };
-            int[] nfpMonths  = { 1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 1,  2,  3,  4,  5,  6 };
-            int[] nfpDays    = { 10,  7,  7,  4,  2,  6,  4,  1,  5,  3,  7,  5, 9,  6,  6,  3,  2,  5 };
-            for (int i = 0; i < nfpYears.Length; i++)
-                newsEvents.Add(new DateTime(nfpYears[i], nfpMonths[i], nfpDays[i], 8, 30, 0));
+            int[,] f = {
+                {2023,2,1},{2023,3,22},{2023,5,3},{2023,6,14},{2023,7,26},{2023,9,20},{2023,11,1},{2023,12,13},
+                {2024,1,31},{2024,3,20},{2024,5,1},{2024,6,12},{2024,7,31},{2024,9,18},{2024,11,7},{2024,12,18},
+                {2025,1,29},{2025,3,19},{2025,5,7},{2025,6,18},{2025,7,30},{2025,9,17},{2025,10,29},{2025,12,10},
+                {2026,1,28},{2026,3,18},{2026,4,29},{2026,6,17},{2026,7,29},{2026,9,16},{2026,10,28},{2026,12,9},
+                {2027,1,27},{2027,3,17},{2027,4,28},{2027,6,9},{2027,7,28},{2027,9,15},{2027,10,27},{2027,12,8}
+            };
+            for (int i = 0; i < f.GetLength(0); i++)
+                newsEvents.Add(new DateTime(f[i,0], f[i,1], f[i,2], 14, 0, 0));
+        }
 
-            // FOMC — 2:00 PM ET
-            int[] fomcYears  = { 2025, 2025, 2025, 2025, 2025, 2025, 2025, 2025,
-                                  2026, 2026, 2026, 2026, 2026, 2026, 2026, 2026 };
-            int[] fomcMonths = { 1,  3,  5,  6,  7,  9, 11, 12, 1,  3,  4,  6,  7,  9, 10, 12 };
-            int[] fomcDays   = { 29, 19,  7, 18, 30, 17,  7, 10, 28, 18, 29, 17, 29, 16, 28,  9 };
-            for (int i = 0; i < fomcYears.Length; i++)
-                newsEvents.Add(new DateTime(fomcYears[i], fomcMonths[i], fomcDays[i], 14, 0, 0));
+        // CPI releases (8:30 AM ET) — verified vs BLS, 2025-2026. Pre-session, so
+        // only matters for the whole-day skip. Note Oct-2025 = 24th (shutdown delay).
+        // No clean formula — EXTEND each year from bls.gov/schedule.
+        private void LoadCpiDates()
+        {
+            int[,] c = {
+                {2025,1,15},{2025,2,12},{2025,3,12},{2025,4,10},{2025,5,13},{2025,6,11},
+                {2025,7,15},{2025,8,12},{2025,9,11},{2025,10,24},{2025,11,13},{2025,12,10},
+                {2026,1,13},{2026,2,11},{2026,3,11},{2026,4,10},{2026,5,12},{2026,6,10},
+                {2026,7,14},{2026,8,12},{2026,9,11},{2026,10,14},{2026,11,10},{2026,12,10}
+            };
+            for (int i = 0; i < c.GetLength(0); i++)
+                newsEvents.Add(new DateTime(c[i,0], c[i,1], c[i,2], 8, 30, 0));
+        }
 
-            // CPI — 8:30 AM ET
-            int[] cpiYears   = { 2025, 2025, 2025, 2025, 2025, 2025, 2025, 2025, 2025, 2025, 2025, 2025,
-                                  2026, 2026, 2026, 2026, 2026, 2026 };
-            int[] cpiMonths  = { 1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 1,  2,  3,  4,  5,  6 };
-            int[] cpiDays    = { 15, 12, 12, 10, 13, 11, 15, 12, 10, 15, 13, 10, 15, 11, 11, 14, 13, 11 };
-            for (int i = 0; i < cpiYears.Length; i++)
-                newsEvents.Add(new DateTime(cpiYears[i], cpiMonths[i], cpiDays[i], 8, 30, 0));
+        // NFP = first Friday of each month, 8:30 AM ET. Computed → never expires.
+        private void LoadComputedNfp()
+        {
+            for (int yr = 2023; yr <= 2033; yr++)
+            {
+                for (int mo = 1; mo <= 12; mo++)
+                {
+                    DateTime d = new DateTime(yr, mo, 1);
+                    while (d.DayOfWeek != DayOfWeek.Friday) d = d.AddDays(1);
+                    newsEvents.Add(new DateTime(yr, mo, d.Day, 8, 30, 0));
+                }
+            }
+        }
 
-            Print("Hardcoded news loaded: " + newsEvents.Count + " events");
+        // Does the current bar's DATE contain any scheduled-news event?
+        private bool IsNewsDay(DateTime barTime)
+        {
+            foreach (var ev in newsEvents)
+                if (ev.Date == barTime.Date) return true;
+            return false;
         }
 
         private bool IsNewsBlackout(DateTime barTime)
@@ -450,6 +489,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if ((hour == 12) || (hour == 13 && minute < 30)) return;
 
             // ── News blackout ─────────────────────────────
+            if (skipNewsDayEntirely && IsNewsDay(Time[0])) return;   // whole-day skip
             if (IsNewsBlackout(Time[0])) return;
 
             // ── Trading hours ─────────────────────────────
