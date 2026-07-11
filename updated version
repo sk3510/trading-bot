@@ -24,8 +24,8 @@
 // ║    FIX 1 — ManagePosition() uses Position.AveragePrice for all  ║
 // ║             post-fill logic (partial TP, trail, stop exit PnL)  ║
 // ║    FIX 2 — tradedToday moved to OnExecutionUpdate on fill        ║
-// ║    FIX 3 — partialPnl tracked separately; Discord shows total    ║
-// ║             trade PnL (partial leg + remaining leg combined)     ║
+// ║    FIX 3 — total trade PnL (partial leg + final leg) reported    ║
+// ║             on close; now summed from fills in OnExecutionUpdate ║
 // ║    FIX 4 — lowWaterMark initialized to entryPrice at short entry ║
 // ║                                                                  ║
 // ║  CHANGE (2026-06):                                               ║
@@ -34,6 +34,34 @@
 // ║    - Profit target non-terminal by default (StopAtProfitTarget): ║
 // ║      live rolls into the funded stage and keeps trading past     ║
 // ║      $3,000. Set StopAtProfitTarget=true to measure eval pass.   ║
+// ║                                                                  ║
+// ║  CHANGE (2026-07) — TWO-TIER STOP (soft bar-close + hard intrabar):║
+// ║    - SOFT stop = rejection level, checked at BAR CLOSE in         ║
+// ║      ManagePosition (`if Close<=stopPrice ExitLong`). Patient —   ║
+// ║      lets intrabar wicks that recover survive (this is what keeps ║
+// ║      PF up; a pure intrabar stop wick-outs winners).             ║
+// ║    - HARD stop = SetStopLoss(sig, Price, hardSl, false), a REAL   ║
+// ║      resting order at HardStopPts (=110, sweep knee) past entry,  ║
+// ║      or the soft distance if wider. Fires INTRABAR — the          ║
+// ║      catastrophe cap that does NOT wait for candle close.         ║
+// ║      Attaches on the fill, honored in backtest AND live, auto-    ║
+// ║      syncs qty on the partial. Caps the 2026-07-10 blow-through   ║
+// ║      (168-pt candle, -$996) → now bounded ≈ 110*3*$2 ≈ $660.     ║
+// ║    - Partial = bar-close market ExitLong(1) (UNCHANGED from PF    ║
+// ║      1.77 baseline). It moves the SOFT stop to BE; the trail      ║
+// ║      moves the SOFT stop. The HARD stop stays fixed at entry      ║
+// ║      level (so it never wick-outs winners during the trail).      ║
+// ║    - Exits broker/bar-close managed → consec-loss + net-PnL +     ║
+// ║      close alert from fills (OnExecutionUpdate / OnPositionUpdate).║
+// ║    - HardStopPts=110 chosen from the sweep: net-profit knee, flat ║
+// ║      out to ~180, cliffs below ~106 (starts clipping recoveries). ║
+// ║      Wider ≠ better PF (plateau); tighter clips winners. NOTE the ║
+// ║      PF drop vs the 1.77 memory is the DATE WINDOW, not the stop; ║
+// ║      and aggregate DD (~$2.2k) still exceeds the $1,900 eval cap  ║
+// ║      — a sizing/frequency problem to solve separately.            ║
+// ║    - REVERTED earlier: ExitLongStopMarket/ExitLongLimit bracket   ║
+// ║      from OnExecutionUpdate placed a 0-qty stop in the Analyzer   ║
+// ║      (Position not updated there) → losses uncapped. Don't redo.  ║
 // ╚══════════════════════════════════════════════════════════════════╝
 
 using System;
@@ -80,6 +108,18 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             get { return maxLossDollars; }
             set { maxLossDollars = Math.Max(100, value); }
+        }
+
+        // Hard intrabar catastrophe stop, in points. The soft stop (rejection level)
+        // is evaluated at BAR CLOSE; this hard stop rests at the exchange and fires
+        // INTRABAR the moment price is this many points past entry — the "don't wait
+        // for candle close if it goes this far" safeguard. Set wide enough that normal
+        // wicks don't hit it. Effective max intrabar loss ≈ HardStopPts * contracts * $2.
+        [NinjaScriptProperty]
+        public double HardStopPts
+        {
+            get { return hardStopPts; }
+            set { hardStopPts = Math.Max(10, value); }
         }
 
         [NinjaScriptProperty]
@@ -153,6 +193,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double trailActivation   = 120;
         private double trailOffset       = 25;
         private double maxLossDollars    = 400;
+        private double hardStopPts        = 110;   // intrabar catastrophe stop (pts) — sweep knee
         private int    emaPeriod         = 40;
         private int    maxConsecLosses   = 10;
         private int    contracts         = 3;
@@ -207,9 +248,17 @@ namespace NinjaTrader.NinjaScript.Strategies
         private string tradeSide     = "";
         private double initialRisk   = 0;
 
-        // FIX 3 — tracks realized PnL from partial TP leg
-        // so final exit Discord alert can show total trade PnL
-        private double partialPnl    = 0;
+        // ─── EXCHANGE-RESIDENT STOP (2026-07) ─────────────
+        // The protective stop is a real resting order via SetStopLoss (honored in
+        // backtest and live). The stop fills at the broker/engine, not in ManagePosition,
+        // so realized PnL + consec-loss + the final Discord alert are computed from
+        // FILL callbacks (OnExecutionUpdate / OnPositionUpdate).
+        //   actualEntryFill  — captured on the entry fill; survives position-flat
+        //                      (Position.AveragePrice resets to 0 the instant we go flat).
+        //   realizedTradePnl — accumulates every exit fill (partial leg + final leg)
+        //                      using real fill prices → true net trade PnL.
+        private double actualEntryFill  = 0;
+        private double realizedTradePnl = 0;
 
         // ─── SESSION RANGE TRACKING ───────────────────────
         private double sessionHigh     = 0;
@@ -277,6 +326,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 TrailActivation   = 120;
                 TrailOffset       = 25;
                 MaxLossDollars    = 400;
+                HardStopPts       = 110;
                 EmaPeriod         = 40;
                 MaxConsecLosses   = 10;
                 SkipToday         = false;
@@ -444,7 +494,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 vwapCumVol     = 0;
                 trailActive    = false;
                 partialTaken   = false;
-                partialPnl     = 0;     // FIX 3 — reset partial PnL tracker at session open
+                realizedTradePnl = 0;   // reset trade PnL accumulator at session open
+                actualEntryFill  = 0;
                 highWaterMark  = 0;
                 lowWaterMark   = 0;
                 tradeSide      = "";
@@ -502,9 +553,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             TryEntry();
         }
 
-        // ─── FIX 2 — tradedToday set on confirmed fill ────
-        // Prevents silent day lockout if order is rejected by broker.
-        // tradedToday = true is no longer set in TryEntry().
+        // ─── FIX 2 + stop/PnL accounting ──────────────────
+        // Runs on every fill. The protective stop itself is owned by SetStopLoss
+        // (armed in TryEntry), so this method only:
+        //   (A) Accumulates realized PnL on every EXIT execution (partial + final)
+        //       vs the entry fill — for consec-loss + the close alert.
+        //   (B) Confirms the entry fill: sets tradedToday (FIX 2) and captures the
+        //       entry price FROM THE EXECUTION (not Position.AveragePrice, which is
+        //       not reliably populated here in the Strategy Analyzer engine).
         protected override void OnExecutionUpdate(
             Execution execution,
             string executionId,
@@ -515,13 +571,58 @@ namespace NinjaTrader.NinjaScript.Strategies
             DateTime time)
         {
             if (execution.Order == null) return;
-            if (execution.Order.OrderState != OrderState.Filled) return;
 
-            if (execution.Order.Name == "RB Long" || execution.Order.Name == "RB Short")
+            OrderAction action = execution.Order.OrderAction;
+            string      name   = execution.Order.Name;
+
+            // (A) Exit fills — Sell closes a long, BuyToCover closes a short.
+            if (actualEntryFill > 0)
             {
-                tradedToday = true;
-                Print(time + " FILL CONFIRMED — tradedToday set | " + execution.Order.Name
-                    + " @ " + price.ToString("F2") + " x" + quantity);
+                if (action == OrderAction.Sell)
+                    realizedTradePnl += (price - actualEntryFill) * quantity * 2;
+                else if (action == OrderAction.BuyToCover)
+                    realizedTradePnl += (actualEntryFill - price) * quantity * 2;
+            }
+
+            // (B) Entry fill → tradedToday + capture entry price from the execution.
+            if ((name == "RB Long" || name == "RB Short") && actualEntryFill == 0
+                && (action == OrderAction.Buy || action == OrderAction.SellShort))
+            {
+                tradedToday     = true;
+                actualEntryFill = price;
+                Print(time + " FILL CONFIRMED | " + name + " @ " + price.ToString("F2")
+                    + " | stop=" + stopPrice.ToString("F2"));
+            }
+        }
+
+        // ─── Trade close detection (broker-managed exits) ─
+        // The resting stop / trail / halt closes the position asynchronously, so
+        // consec-loss tracking, the net-PnL Discord alert, and state reset now
+        // happen here — when the position returns to flat — instead of in a poll.
+        protected override void OnPositionUpdate(
+            Position position,
+            double averagePrice,
+            int quantity,
+            MarketPosition marketPosition)
+        {
+            if (marketPosition == MarketPosition.Flat && tradeSide != "")
+            {
+                string side     = tradeSide;
+                string exitType = trailActive ? "TRAIL EXIT" : "STOP/EXIT";
+
+                UpdateConsecLosses(realizedTradePnl);
+                Print(Time[0] + " TRADE CLOSED " + side + " (" + exitType + ")"
+                    + " netPnl=$" + realizedTradePnl.ToString("F2"));
+                SendDiscordAlert((realizedTradePnl >= 0 ? "✅" : "❌") + " " + side.ToUpper()
+                    + " (" + exitType + ") | PnL: "
+                    + (realizedTradePnl >= 0 ? "+$" : "-$") + Math.Abs(realizedTradePnl).ToString("F2"));
+
+                // reset for the next trade
+                realizedTradePnl = 0;
+                actualEntryFill  = 0;
+                tradeSide        = "";
+                partialTaken     = false;
+                trailActive      = false;
             }
         }
 
@@ -590,11 +691,21 @@ namespace NinjaTrader.NinjaScript.Strategies
                 highWaterMark = c;
                 trailActive   = false;
                 partialTaken  = false;
-                partialPnl    = 0;    // FIX 3 — reset before new trade
+                realizedTradePnl = 0;   // fresh trade — accumulator starts clean
+                actualEntryFill  = 0;   // captured on the fill in OnExecutionUpdate
                 tradeSide     = "long";
 
-                // FIX 2 — tradedToday is now set in OnExecutionUpdate on confirmed fill
+                // Two-tier stop:
+                //   soft (stopPrice = sl) — rejection level, checked at BAR CLOSE in
+                //     ManagePosition. Patient: ignores intrabar wicks that recover.
+                //   hard (hardSl) — resting SetStopLoss at HardStopPts (or the soft
+                //     distance, whichever is wider). Fires INTRABAR — the catastrophe
+                //     cap that doesn't wait for candle close.
+                double hardSl = c - Math.Max(hardStopPts, c - sl);
+                SetStopLoss("RB Long", CalculationMode.Price, hardSl, false);
                 EnterLong(contracts, "RB Long");
+
+                Print(Time[0] + " LONG hardStop=" + hardSl.ToString("F2"));
 
                 Print(Time[0] + " LONG entry=" + c.ToString("F2")
                     + " sl=" + sl.ToString("F2")
@@ -627,11 +738,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lowWaterMark = c;
                 trailActive  = false;
                 partialTaken = false;
-                partialPnl   = 0;    // FIX 3 — reset before new trade
+                realizedTradePnl = 0;   // fresh trade — accumulator starts clean
+                actualEntryFill  = 0;   // captured on the fill in OnExecutionUpdate
                 tradeSide    = "short";
 
-                // FIX 2 — tradedToday is now set in OnExecutionUpdate on confirmed fill
+                // Two-tier stop (see long-side note): soft = bar-close, hard = intrabar.
+                double hardSl = c + Math.Max(hardStopPts, sl - c);
+                SetStopLoss("RB Short", CalculationMode.Price, hardSl, false);
                 EnterShort(contracts, "RB Short");
+
+                Print(Time[0] + " SHORT hardStop=" + hardSl.ToString("F2"));
 
                 Print(Time[0] + " SHORT entry=" + c.ToString("F2")
                     + " sl=" + sl.ToString("F2")
@@ -650,9 +766,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             double c = Close[0];
 
-            // ── FIX 1 — use actual fill price for all post-fill logic ──
-            // Position.AveragePrice reflects the real fill, not bar close estimate.
-            // entryPrice (set in TryEntry) is only used for initial stop sizing.
+            // FIX 1 — post-fill logic uses the real fill price (Position.AveragePrice).
             double fillPrice = Position.AveragePrice;
 
             if (tradeSide == "long")
@@ -660,23 +774,22 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (High[0] > highWaterMark)
                     highWaterMark = High[0];
 
-                // ── Partial TP at 1R (using fill price) ──────────────
+                // Partial TP at 1R (bar-close market — same as the PF 1.77 baseline).
+                // Moves the SOFT stop to breakeven. The hard/intrabar stop stays put.
                 if (!partialTaken && initialRisk > 0
                     && c >= fillPrice + initialRisk
                     && Position.Quantity > 1)
                 {
-                    // FIX 3 — record partial leg PnL before exit
-                    partialPnl = (fillPrice + initialRisk - fillPrice) * 1 * 2;  // = initialRisk * 2
                     ExitLong(1, "Partial TP", "RB Long");
                     partialTaken = true;
-                    stopPrice    = fillPrice;  // FIX 1 — breakeven uses fill price, not bar close estimate
+                    stopPrice    = fillPrice;   // soft stop → breakeven
                     Print(Time[0] + " PARTIAL TP long @ " + c.ToString("F2")
-                        + " stop→BE fill=" + fillPrice.ToString("F2"));
+                        + " soft→BE " + fillPrice.ToString("F2"));
                     SendDiscordAlert("✂️ PARTIAL TP LONG | " + c.ToString("F2")
-                        + " | Stop → BE: " + fillPrice.ToString("F2"));
+                        + " | Soft stop → BE: " + fillPrice.ToString("F2"));
                 }
 
-                // ── Trail (using fill price for activation) ───────────
+                // Trail the SOFT (bar-close) stop up. Hard stop stays at its entry level.
                 double profitPts = highWaterMark - fillPrice;
                 if (profitPts >= trailActivation && !trailActive)
                 {
@@ -689,50 +802,35 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (newStop > stopPrice) stopPrice = newStop;
                 }
 
-                // ── Exit (PnL uses fill price and remaining quantity) ──
+                // SOFT stop — evaluated at BAR CLOSE only (patient; lets intrabar wicks
+                // recover). The hard intrabar cap is the resting SetStopLoss set at entry.
                 if (c <= stopPrice)
                 {
-                    // FIX 3 — total trade PnL = partial leg + remaining leg
-                    double remainPnl    = (c - fillPrice) * Position.Quantity * 2;
-                    double totalTradePnl = partialPnl + remainPnl;
-                    string exitType     = trailActive ? "TRAIL EXIT" : "STOP LOSS";
-                    UpdateConsecLosses(totalTradePnl);
-                    ExitLong("SL", "RB Long");
-                    Print(Time[0] + " " + exitType + " long @ " + c.ToString("F2")
-                        + " fillPrice=" + fillPrice.ToString("F2")
-                        + " PnL=" + totalTradePnl.ToString("F2"));
-                    SendDiscordAlert((totalTradePnl >= 0 ? "✅" : "❌") + " LONG (" + exitType + ")"
-                        + " | " + c.ToString("F2")
-                        + " | PnL: " + (totalTradePnl >= 0 ? "+$" : "-$") + Math.Abs(totalTradePnl).ToString("F2"));
-                    tradeSide    = "";
-                    partialTaken = false;
-                    partialPnl   = 0;   // FIX 3 — reset after trade closed
+                    ExitLong("SL", "RB Long");   // PnL/consec handled in the fill callbacks
+                    Print(Time[0] + " SOFT STOP long @ " + c.ToString("F2"));
                 }
             }
             else if (tradeSide == "short")
             {
-                // FIX 4 — lowWaterMark is now initialized to entryPrice in TryEntry(),
-                // so this guard is no longer needed, but kept for safety
+                // FIX 4 — lowWaterMark initialized to entryPrice in TryEntry(); guard kept for safety
                 if (Low[0] < lowWaterMark || lowWaterMark == 0)
                     lowWaterMark = Low[0];
 
-                // ── Partial TP at 1R (using fill price) ──────────────
+                // Partial TP at 1R (bar-close market). Soft stop → BE; hard stop stays.
                 if (!partialTaken && initialRisk > 0
                     && c <= fillPrice - initialRisk
                     && Position.Quantity > 1)
                 {
-                    // FIX 3 — record partial leg PnL before exit
-                    partialPnl = initialRisk * 1 * 2;  // short partial: initialRisk pts profit * $2/pt * 1 contract
                     ExitShort(1, "Partial TP", "RB Short");
                     partialTaken = true;
-                    stopPrice    = fillPrice;  // FIX 1 — breakeven uses fill price
+                    stopPrice    = fillPrice;   // soft stop → breakeven
                     Print(Time[0] + " PARTIAL TP short @ " + c.ToString("F2")
-                        + " stop→BE fill=" + fillPrice.ToString("F2"));
+                        + " soft→BE " + fillPrice.ToString("F2"));
                     SendDiscordAlert("✂️ PARTIAL TP SHORT | " + c.ToString("F2")
-                        + " | Stop → BE: " + fillPrice.ToString("F2"));
+                        + " | Soft stop → BE: " + fillPrice.ToString("F2"));
                 }
 
-                // ── Trail (using fill price for activation) ───────────
+                // Trail the SOFT (bar-close) stop down. Hard stop stays at its entry level.
                 double profitPts = fillPrice - lowWaterMark;
                 if (profitPts >= trailActivation && !trailActive)
                 {
@@ -745,24 +843,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (newStop < stopPrice) stopPrice = newStop;
                 }
 
-                // ── Exit (PnL uses fill price and remaining quantity) ──
+                // SOFT stop — bar close only.
                 if (c >= stopPrice)
                 {
-                    // FIX 3 — total trade PnL = partial leg + remaining leg
-                    double remainPnl     = (fillPrice - c) * Position.Quantity * 2;
-                    double totalTradePnl = partialPnl + remainPnl;
-                    string exitType      = trailActive ? "TRAIL EXIT" : "STOP LOSS";
-                    UpdateConsecLosses(totalTradePnl);
                     ExitShort("SL", "RB Short");
-                    Print(Time[0] + " " + exitType + " short @ " + c.ToString("F2")
-                        + " fillPrice=" + fillPrice.ToString("F2")
-                        + " PnL=" + totalTradePnl.ToString("F2"));
-                    SendDiscordAlert((totalTradePnl >= 0 ? "✅" : "❌") + " SHORT (" + exitType + ")"
-                        + " | " + c.ToString("F2")
-                        + " | PnL: " + (totalTradePnl >= 0 ? "+$" : "-$") + Math.Abs(totalTradePnl).ToString("F2"));
-                    tradeSide    = "";
-                    partialTaken = false;
-                    partialPnl   = 0;   // FIX 3 — reset after trade closed
+                    Print(Time[0] + " SOFT STOP short @ " + c.ToString("F2"));
                 }
             }
         }
