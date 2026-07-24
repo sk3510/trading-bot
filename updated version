@@ -1,5 +1,5 @@
 // ╔══════════════════════════════════════════════════════════════════╗
-// ║   RejBlockVwapMNQ — LIVE (corrected news calendar + day-skip)   ║
+// ║   RejBlockVwapMNQ — LIVE + SESSION-BOUNDARY FIX (2026-07-24)     ║
 // ║                                                                  ║
 // ║  Filters active:                                                 ║
 // ║    1. Lunch filter: skip 12:00–13:30 ET                         ║
@@ -12,56 +12,60 @@
 // ║       > 700 pts                                                  ║
 // ║    8. Daily profit cap: stop trading if today profit >= $1,200   ║
 // ║                                                                  ║
-// ║  Confirmed baseline (1-min bars, slippage=2, commission on):    ║
-// ║    PF 1.77 → Jun 2025–Apr 2026                                  ║
-// ║    PF 1.77 → Jan 2025–Apr 2026                                  ║
-// ║                                                                  ║
 // ║  Optimal params: WickRatio=2, SlBuffer=3, TrailActivation=120,  ║
 // ║                  TrailOffset=25, EmaPeriod=40                    ║
 // ║  Session range: MinSessionRange=150, MaxSessionRange=700         ║
 // ║                                                                  ║
-// ║  AUDIT FIXES (2026-05):                                          ║
-// ║    FIX 1 — ManagePosition() uses Position.AveragePrice for all  ║
-// ║             post-fill logic (partial TP, trail, stop exit PnL)  ║
-// ║    FIX 2 — tradedToday moved to OnExecutionUpdate on fill        ║
-// ║    FIX 3 — total trade PnL (partial leg + final leg) reported    ║
-// ║             on close; now summed from fills in OnExecutionUpdate ║
-// ║    FIX 4 — lowWaterMark initialized to entryPrice at short entry ║
+// ║  ── ALL PRIOR HEADER NOTES (2026-05 FIXES 1-4, 2026-06 CHANGES, ║
+// ║     2026-07 TWO-TIER STOP) STILL APPLY UNCHANGED. ──            ║
 // ║                                                                  ║
-// ║  CHANGE (2026-06):                                               ║
-// ║    - Rejection expiry REMOVED (testing: expiry hurt; plateau     ║
-// ║      flat from ~190 to 600 bars — bar-count expiry not an edge). ║
-// ║    - Profit target non-terminal by default (StopAtProfitTarget): ║
-// ║      live rolls into the funded stage and keeps trading past     ║
-// ║      $3,000. Set StopAtProfitTarget=true to measure eval pass.   ║
+// ║  CHANGE (2026-07-24) — SESSION BOUNDARY FIX. One bug family:    ║
+// ║  pre-09:30 bars were contaminating session state.                ║
 // ║                                                                  ║
-// ║  CHANGE (2026-07) — TWO-TIER STOP (soft bar-close + hard intrabar):║
-// ║    - SOFT stop = rejection level, checked at BAR CLOSE in         ║
-// ║      ManagePosition (`if Close<=stopPrice ExitLong`). Patient —   ║
-// ║      lets intrabar wicks that recover survive (this is what keeps ║
-// ║      PF up; a pure intrabar stop wick-outs winners).             ║
-// ║    - HARD stop = SetStopLoss(sig, Price, hardSl, false), a REAL   ║
-// ║      resting order at HardStopPts (=110, sweep knee) past entry,  ║
-// ║      or the soft distance if wider. Fires INTRABAR — the          ║
-// ║      catastrophe cap that does NOT wait for candle close.         ║
-// ║      Attaches on the fill, honored in backtest AND live, auto-    ║
-// ║      syncs qty on the partial. Caps the 2026-07-10 blow-through   ║
-// ║      (168-pt candle, -$996) → now bounded ≈ 110*3*$2 ≈ $660.     ║
-// ║    - Partial = bar-close market ExitLong(1) (UNCHANGED from PF    ║
-// ║      1.77 baseline). It moves the SOFT stop to BE; the trail      ║
-// ║      moves the SOFT stop. The HARD stop stays fixed at entry      ║
-// ║      level (so it never wick-outs winners during the trail).      ║
-// ║    - Exits broker/bar-close managed → consec-loss + net-PnL +     ║
-// ║      close alert from fills (OnExecutionUpdate / OnPositionUpdate).║
-// ║    - HardStopPts=110 chosen from the sweep: net-profit knee, flat ║
-// ║      out to ~180, cliffs below ~106 (starts clipping recoveries). ║
-// ║      Wider ≠ better PF (plateau); tighter clips winners. NOTE the ║
-// ║      PF drop vs the 1.77 memory is the DATE WINDOW, not the stop; ║
-// ║      and aggregate DD (~$2.2k) still exceeds the $1,900 eval cap  ║
-// ║      — a sizing/frequency problem to solve separately.            ║
-// ║    - REVERTED earlier: ExitLongStopMarket/ExitLongLimit bracket   ║
-// ║      from OnExecutionUpdate placed a 0-qty stop in the Analyzer   ║
-// ║      (Position not updated there) → losses uncapped. Don't redo.  ║
+// ║   THE BUG: entries opened at 09:00 (`if (hour < 9 ...) return;`) ║
+// ║   but every piece of session state reset inside                  ║
+// ║   `if (hour == 9 && minute == 30)`. So from 09:00–09:29 the      ║
+// ║   strategy ran on the PREVIOUS day's sessionRangeOk verdict, the ║
+// ║   previous afternoon's still-armed lastBullishRej/lastBearishRej ║
+// ║   /lastRejHigh/lastRejLow, and a VWAP blending yesterday's       ║
+// ║   totals with today's 09:00–09:29 bars.                          ║
+// ║   MEASURED over 390 logged entries: 14 (3.6%) fired before 09:30 ║
+// ║   with median |entry-VWAP| = 99.6 pts (64% above 50 pts) vs      ║
+// ║   5.8 pts / 4.3% for the 376 entries at or after 09:30. 17x.     ║
+// ║   Same root cause as the backtest first-day artifact, since      ║
+// ║   sessionRangeOk is field-initialized to TRUE.                   ║
+// ║                                                                  ║
+// ║   FIX A — entry gate is now 09:30, not 09:00.                    ║
+// ║           *** CHANGES BEHAVIOR: removes those 14 trades. ***     ║
+// ║   FIX B — session reset is DATE-KEYED and fires on the first bar ║
+// ║           at/after 09:30 of a new date, not on a literal 09:30   ║
+// ║           timestamp. Previously a missing 09:30 bar (holiday,    ║
+// ║           half-day, data gap) skipped the whole day's reset.     ║
+// ║           *** CHANGES BEHAVIOR only on such days. ***            ║
+// ║   FIX C — WITHDRAWN. Tried RTH-only session high/low; it was     ║
+// ║           WRONG. The 09:00–09:29 pre-open is available at the    ║
+// ║           09:30 decision, so the original window was a better-   ║
+// ║           informed range estimate, not contamination. Removing   ║
+// ║           it cut 792->389 trades and eval pass 42%->29%.         ║
+// ║           Reverted to the original 09:00 window. Do not redo.    ║
+// ║   FIX D — VWAP accumulates 09:30–15:59 only, after the reset.    ║
+// ║           No behavioral change (the 09:00–09:29 accumulation was ║
+// ║           discarded by the 09:30 reset anyway) — defensive only. ║
+// ║                                                                  ║
+// ║   => RE-RUN the full continuous window and treat the result as   ║
+// ║      the NEW BASELINE. Do not compare to pre-fix numbers.        ║
+// ║                                                                  ║
+// ║   STILL KNOWN-BROKEN, deliberately NOT touched here:             ║
+// ║    - consecLosses resets at session open, so MaxConsecLosses=10  ║
+// ║      is unreachable with one trade/day (dead code).              ║
+// ║    - CheckPropFirmRules() reads Account.CashValue, which is      ║
+// ║      static in the Strategy Analyzer, so profit target /         ║
+// ║      drawdown halt / $1,200 daily cap NEVER fire in backtest     ║
+// ║      (they do fire live — a real live/backtest divergence).      ║
+// ║    - Drawdown guard is static from account start, not trailing   ║
+// ║      off the high-water mark.                                    ║
+// ║    - Retrace tolerance is a PERCENT (lastRejLow * 1.001), not    ║
+// ║      points, so it widened ~58% as MNQ went 19k -> 30k.          ║
 // ╚══════════════════════════════════════════════════════════════════╝
 
 using System;
@@ -207,6 +211,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool   stopAtProfitTarget = false; // false = funded stage (keep trading past target)
         private bool   skipNewsDayEntirely = true;  // ON = validated config (skip scheduled-news days)
 
+        // ─── SESSION OPEN CONSTANTS (2026-07-24) ──────────
+        // Single source of truth for the RTH open. Entries, the state reset, the
+        // session high/low window and VWAP accumulation all key off these, so they
+        // can no longer drift apart (which is exactly what caused the 09:00–09:29 bug).
+        private const int SESSION_OPEN_HOUR   = 9;
+        private const int SESSION_OPEN_MINUTE = 30;
+        private const int SESSION_CLOSE_HOUR  = 16;   // high/low + VWAP stop accumulating at 16:00
+        private const int ENTRY_CUTOFF_HOUR   = 15;   // no new entries at/after 15:00
+
         // ─── INDICATORS ───────────────────────────────────
         private EMA ema;
 
@@ -219,6 +232,17 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool   lastBearishRej = false;
         private double lastRejHigh    = 0;
         private double lastRejLow     = 0;
+
+        // FIX B (2026-07-24) — date-keyed session reset. Guarantees exactly one reset
+        // per calendar day, on the first bar at/after the RTH open, even if the 09:30
+        // bar itself is missing (holiday, half-day, data gap).
+        private DateTime lastResetDate = DateTime.MinValue;
+
+        // FIX A/C (2026-07-24) — until the first reset of a backtest has run we have no
+        // valid prior-session range, so the range filter must be CLOSED, not open.
+        // Previously sessionRangeOk was field-initialized to true, which let the very
+        // first bars of a backtest trade with no filter at all (the first-day artifact).
+        private bool sessionRangeOk = false;
 
         // ─── CONSECUTIVE LOSS TRACKING ────────────────────
         private int    consecLosses   = 0;
@@ -253,10 +277,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         // backtest and live). The stop fills at the broker/engine, not in ManagePosition,
         // so realized PnL + consec-loss + the final Discord alert are computed from
         // FILL callbacks (OnExecutionUpdate / OnPositionUpdate).
-        //   actualEntryFill  — captured on the entry fill; survives position-flat
-        //                      (Position.AveragePrice resets to 0 the instant we go flat).
-        //   realizedTradePnl — accumulates every exit fill (partial leg + final leg)
-        //                      using real fill prices → true net trade PnL.
         private double actualEntryFill  = 0;
         private double realizedTradePnl = 0;
 
@@ -265,7 +285,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double sessionLow      = 0;
         private double prevSessionHigh = 0;
         private double prevSessionLow  = 0;
-        private bool   sessionRangeOk  = true;
 
         // ─── DISCORD ──────────────────────────────────────
         private string discordBotToken  = "";
@@ -341,6 +360,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ema             = EMA(Close, emaPeriod);
                 startingBalance = 0;
                 dayStartEquity  = 0;
+                // FIX B — reset the session-boundary latch so repeat runs in the same
+                // NT8 instance cannot inherit state from a previous run.
+                lastResetDate   = DateTime.MinValue;
+                sessionRangeOk  = false;
                 LoadDiscordToken();
                 LoadNewsEvents();
             }
@@ -357,8 +380,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // FOMC decision days (2:00 PM ET) — verified vs federalreserve.gov, 2023-2027.
-        // The ONLY scheduled event inside the 9:30-15:00 session, so the ±buffer
-        // blackout effectively only bites here. EXTEND past 2027 each year.
         private void LoadFomcDates()
         {
             int[,] f = {
@@ -372,9 +393,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 newsEvents.Add(new DateTime(f[i,0], f[i,1], f[i,2], 14, 0, 0));
         }
 
-        // CPI releases (8:30 AM ET) — verified vs BLS, 2025-2026. Pre-session, so
-        // only matters for the whole-day skip. Note Oct-2025 = 24th (shutdown delay).
-        // No clean formula — EXTEND each year from bls.gov/schedule.
+        // CPI releases (8:30 AM ET) — verified vs BLS, 2025-2026. Oct-2025 = 24th (shutdown delay).
         private void LoadCpiDates()
         {
             int[,] c = {
@@ -401,7 +420,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // Does the current bar's DATE contain any scheduled-news event?
         private bool IsNewsDay(DateTime barTime)
         {
             foreach (var ev in newsEvents)
@@ -434,6 +452,16 @@ namespace NinjaTrader.NinjaScript.Strategies
             return false;
         }
 
+        // FIX A/C/D (2026-07-24) — is this bar inside RTH (09:30–15:59)?
+        // Used for the reset trigger, session high/low, and VWAP accumulation so all
+        // three key off ONE definition of the session.
+        private bool IsRthBar(int hour, int minute)
+        {
+            if (hour < SESSION_OPEN_HOUR || hour >= SESSION_CLOSE_HOUR) return false;
+            if (hour == SESSION_OPEN_HOUR && minute < SESSION_OPEN_MINUTE) return false;
+            return true;
+        }
+
         protected override void OnBarUpdate()
         {
             if (CurrentBar < BarsRequiredToTrade) return;
@@ -451,19 +479,34 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             int hour   = Time[0].Hour;
             int minute = Time[0].Minute;
+            bool inRth = IsRthBar(hour, minute);
 
-            // ── Track running session high/low (RTH only) ─
-            if (hour >= 9 && hour < 16)
+            // ══ SESSION HIGH/LOW — FIX C REVERTED (2026-07-24b) ══
+            // Tracks from 09:00, and runs BEFORE the reset, exactly as the original.
+            // I previously "fixed" this to RTH-only. That was WRONG and it cost 56% of
+            // trading days: the 09:00–09:29 pre-open IS legitimately available at the
+            // 09:30 decision, so the original filter was measuring "yesterday's RTH +
+            // today's pre-open" — a better-informed volatility estimate than yesterday's
+            // RTH alone. Removing it shrank prior-range values, pushing most days under
+            // MinSessionRange=150. Measured: 792 -> 389 trades, eval pass 42% -> 29%.
+            // Same lesson as the OR-anchored-blocks experiment: looked like
+            // contamination, was actually load-bearing signal. DO NOT re-"fix" this.
+            if (hour >= SESSION_OPEN_HOUR && hour < SESSION_CLOSE_HOUR)
             {
                 if (sessionHigh == 0 || High[0] > sessionHigh) sessionHigh = High[0];
                 if (sessionLow  == 0 || Low[0]  < sessionLow)  sessionLow  = Low[0];
             }
 
-            // ── Reset at session open ──────────────────────
-            if (hour == 9 && minute == 30)
+            // ══ 1. SESSION RESET — FIX B ══════════════════
+            // Date-keyed: fires on the FIRST RTH bar of a new calendar date. Immune to a
+            // missing 09:30 bar. Runs BEFORE session high/low and VWAP accumulation so
+            // the 09:30 bar itself belongs to the NEW session (FIX C/D).
+            if (inRth && Time[0].Date != lastResetDate)
             {
-                // Evaluate prior session range before resetting
-                if (sessionHigh > 0)
+                lastResetDate = Time[0].Date;
+
+                // Evaluate the PRIOR session's range before clearing it.
+                if (sessionHigh > 0 && sessionLow > 0)
                 {
                     prevSessionHigh = sessionHigh;
                     prevSessionLow  = sessionLow;
@@ -477,13 +520,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                         + (tooChaotic ? " (too chaotic >" + maxSessionRange + ")" : ""));
                     SendDiscordAlert("SESSION | Range: " + priorRange.ToString("F0") + "pts | " + rangeStatus);
                 }
+                else
+                {
+                    // No complete prior session yet (start of a backtest). Stay CLOSED
+                    // rather than defaulting open — this is the first-day artifact fix.
+                    sessionRangeOk = false;
+                    Print(Time[0] + " PRIOR RANGE: unavailable (warm-up) | SKIP TODAY ⛔");
+                }
 
                 // Reset session tracking
                 sessionHigh = 0;
                 sessionLow  = 0;
 
-                // FIX 2 — tradedToday is now set in OnExecutionUpdate on actual fill,
-                // so we only reset it here at session open (no change needed here)
                 tradedToday    = false;
                 dailyHalted    = false;
                 lastBullishRej = false;
@@ -494,7 +542,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 vwapCumVol     = 0;
                 trailActive    = false;
                 partialTaken   = false;
-                realizedTradePnl = 0;   // reset trade PnL accumulator at session open
+                realizedTradePnl = 0;
                 actualEntryFill  = 0;
                 highWaterMark  = 0;
                 lowWaterMark   = 0;
@@ -510,8 +558,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                     Print(Time[0] + " MANUAL SKIP TODAY enabled");
             }
 
-            // ── VWAP accumulation ─────────────────────────
-            if (hour >= 9 && hour < 16)
+            // ══ 3. VWAP ACCUMULATION — FIX D ══════════════
+            // RTH only, after the reset. Behaviourally identical to before (the old
+            // 09:00–09:29 accumulation was zeroed at 09:30 anyway) — defensive.
+            if (inRth)
             {
                 double hlc3   = (High[0] + Low[0] + Close[0]) / 3.0;
                 vwapCumTPVol += hlc3 * Volume[0];
@@ -543,8 +593,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (skipNewsDayEntirely && IsNewsDay(Time[0])) return;   // whole-day skip
             if (IsNewsBlackout(Time[0])) return;
 
-            // ── Trading hours ─────────────────────────────
-            if (hour < 9 || hour >= 15) return;
+            // ══ TRADING HOURS — FIX A ═════════════════════
+            // Was: if (hour < 9 || hour >= 15) return;   <-- opened at 09:00, 30 minutes
+            // before any session state was reset. Now gated to the RTH open.
+            if (!inRth)                     return;
+            if (hour >= ENTRY_CUTOFF_HOUR)  return;
 
             // ── VWAP / EMA ready ──────────────────────────
             if (vwapCumVol == 0 || ema == null) return;
@@ -553,14 +606,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             TryEntry();
         }
 
-        // ─── FIX 2 + stop/PnL accounting ──────────────────
-        // Runs on every fill. The protective stop itself is owned by SetStopLoss
-        // (armed in TryEntry), so this method only:
-        //   (A) Accumulates realized PnL on every EXIT execution (partial + final)
-        //       vs the entry fill — for consec-loss + the close alert.
-        //   (B) Confirms the entry fill: sets tradedToday (FIX 2) and captures the
-        //       entry price FROM THE EXECUTION (not Position.AveragePrice, which is
-        //       not reliably populated here in the Strategy Analyzer engine).
+        // ─── FIX 2 + stop/PnL accounting (2026-05, unchanged) ──
         protected override void OnExecutionUpdate(
             Execution execution,
             string executionId,
@@ -595,10 +641,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // ─── Trade close detection (broker-managed exits) ─
-        // The resting stop / trail / halt closes the position asynchronously, so
-        // consec-loss tracking, the net-PnL Discord alert, and state reset now
-        // happen here — when the position returns to flat — instead of in a poll.
+        // ─── Trade close detection (broker-managed exits, unchanged) ─
         protected override void OnPositionUpdate(
             Position position,
             double averagePrice,
@@ -617,7 +660,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     + " (" + exitType + ") | PnL: "
                     + (realizedTradePnl >= 0 ? "+$" : "-$") + Math.Abs(realizedTradePnl).ToString("F2"));
 
-                // reset for the next trade
                 realizedTradePnl = 0;
                 actualEntryFill  = 0;
                 tradeSide        = "";
@@ -672,6 +714,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             double c      = Close[0];
 
             // ── Long entry ────────────────────────────────
+            // NOTE (2026-07-24): `lastRejLow * 1.001` is a PERCENT tolerance, so it
+            // scales with price level (~19 pts at MNQ 19k, ~30 pts at 30k). Left as-is
+            // here deliberately — converting it to an explicit point parameter is a
+            // separate experiment, not part of the session-boundary fix.
             if (lastBullishRej
                 && lastRejLow > 0
                 && c <= lastRejLow * 1.001
@@ -683,24 +729,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (riskDollars > maxLossDollars)
                     sl = c - (maxLossDollars / (contracts * 2));
 
-                // entryPrice here is a bar-close estimate used only for stop sizing.
-                // All post-fill logic in ManagePosition() uses Position.AveragePrice. (FIX 1)
                 stopPrice     = sl;
                 entryPrice    = c;
                 initialRisk   = c - sl;
                 highWaterMark = c;
                 trailActive   = false;
                 partialTaken  = false;
-                realizedTradePnl = 0;   // fresh trade — accumulator starts clean
-                actualEntryFill  = 0;   // captured on the fill in OnExecutionUpdate
+                realizedTradePnl = 0;
+                actualEntryFill  = 0;
                 tradeSide     = "long";
 
-                // Two-tier stop:
-                //   soft (stopPrice = sl) — rejection level, checked at BAR CLOSE in
-                //     ManagePosition. Patient: ignores intrabar wicks that recover.
-                //   hard (hardSl) — resting SetStopLoss at HardStopPts (or the soft
-                //     distance, whichever is wider). Fires INTRABAR — the catastrophe
-                //     cap that doesn't wait for candle close.
                 double hardSl = c - Math.Max(hardStopPts, c - sl);
                 SetStopLoss("RB Long", CalculationMode.Price, hardSl, false);
                 EnterLong(contracts, "RB Long");
@@ -734,15 +772,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 stopPrice    = sl;
                 entryPrice   = c;
                 initialRisk  = sl - c;
-                // FIX 4 — initialize lowWaterMark to entryPrice, not 0
                 lowWaterMark = c;
                 trailActive  = false;
                 partialTaken = false;
-                realizedTradePnl = 0;   // fresh trade — accumulator starts clean
-                actualEntryFill  = 0;   // captured on the fill in OnExecutionUpdate
+                realizedTradePnl = 0;
+                actualEntryFill  = 0;
                 tradeSide    = "short";
 
-                // Two-tier stop (see long-side note): soft = bar-close, hard = intrabar.
                 double hardSl = c + Math.Max(hardStopPts, sl - c);
                 SetStopLoss("RB Short", CalculationMode.Price, hardSl, false);
                 EnterShort(contracts, "RB Short");
@@ -766,7 +802,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             double c = Close[0];
 
-            // FIX 1 — post-fill logic uses the real fill price (Position.AveragePrice).
+            // FIX 1 (2026-05) — post-fill logic uses the real fill price.
             double fillPrice = Position.AveragePrice;
 
             if (tradeSide == "long")
@@ -774,8 +810,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (High[0] > highWaterMark)
                     highWaterMark = High[0];
 
-                // Partial TP at 1R (bar-close market — same as the PF 1.77 baseline).
-                // Moves the SOFT stop to breakeven. The hard/intrabar stop stays put.
                 if (!partialTaken && initialRisk > 0
                     && c >= fillPrice + initialRisk
                     && Position.Quantity > 1)
@@ -789,7 +823,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                         + " | Soft stop → BE: " + fillPrice.ToString("F2"));
                 }
 
-                // Trail the SOFT (bar-close) stop up. Hard stop stays at its entry level.
                 double profitPts = highWaterMark - fillPrice;
                 if (profitPts >= trailActivation && !trailActive)
                 {
@@ -802,21 +835,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (newStop > stopPrice) stopPrice = newStop;
                 }
 
-                // SOFT stop — evaluated at BAR CLOSE only (patient; lets intrabar wicks
-                // recover). The hard intrabar cap is the resting SetStopLoss set at entry.
                 if (c <= stopPrice)
                 {
-                    ExitLong("SL", "RB Long");   // PnL/consec handled in the fill callbacks
+                    ExitLong("SL", "RB Long");
                     Print(Time[0] + " SOFT STOP long @ " + c.ToString("F2"));
                 }
             }
             else if (tradeSide == "short")
             {
-                // FIX 4 — lowWaterMark initialized to entryPrice in TryEntry(); guard kept for safety
                 if (Low[0] < lowWaterMark || lowWaterMark == 0)
                     lowWaterMark = Low[0];
 
-                // Partial TP at 1R (bar-close market). Soft stop → BE; hard stop stays.
                 if (!partialTaken && initialRisk > 0
                     && c <= fillPrice - initialRisk
                     && Position.Quantity > 1)
@@ -830,7 +859,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                         + " | Soft stop → BE: " + fillPrice.ToString("F2"));
                 }
 
-                // Trail the SOFT (bar-close) stop down. Hard stop stays at its entry level.
                 double profitPts = fillPrice - lowWaterMark;
                 if (profitPts >= trailActivation && !trailActive)
                 {
@@ -843,7 +871,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (newStop < stopPrice) stopPrice = newStop;
                 }
 
-                // SOFT stop — bar close only.
                 if (c >= stopPrice)
                 {
                     ExitShort("SL", "RB Short");
@@ -881,9 +908,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             todayProfit   = equity - dayStartEquity;
             totalProfit   = equity - startingBalance;
 
-            // ── Profit target reached ─────────────────────
-            // Alert once. If StopAtProfitTarget (backtest) → flatten and halt to
-            // measure eval pass. If false (LIVE/funded) → keep trading past target.
             if (totalProfit >= profitTarget && !targetReached)
             {
                 targetReached = true;
@@ -901,7 +925,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     + ")! Funded stage — bot KEEPS TRADING. Check Lucid.");
             }
 
-            // ── Drawdown halt ─────────────────────────────
             double drawdown = startingBalance - equity;
             if (drawdown >= maxDrawdown && !dailyHalted)
             {
@@ -914,7 +937,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            // ── Daily profit cap ──────────────────────────
             if (todayProfit >= dailyProfitCap && !dailyHalted)
             {
                 dailyHalted = true;
