@@ -5,6 +5,8 @@ using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
 using System.Globalization;
 using System.IO;
+using System.Net;
+using System.Threading.Tasks;
 using NinjaTrader.Cbi;
 using NinjaTrader.Data;
 using NinjaTrader.NinjaScript;
@@ -25,6 +27,20 @@ using NinjaTrader.NinjaScript;
 //   long  if Close > max(upper, VWAP); short if Close < min(lower, VWAP); else flat
 //   flat on the bar ending 16:00
 // Orders are market orders sent at bar close, so they fill at the next bar's open.
+//
+// DISCORD (same setup as RejBlockVwapMNQ): bot token read at runtime from
+// Documents\NinjaTrader 8\discord_token.txt (never in code or GitHub). Alerts fire in REALTIME only
+// (never in backtests or the Optimizer): start, 10:00 session line, every fill with P&L, daily summary.
+//
+// STOP RULE (Oct 2026 final validation): every LIVE session (Sim or prop, never backtest) appends its P&L
+// per contract to Documents\NinjaTrader 8\NoiseAreaMNQ_live_ledger.csv (one row per date per account; all
+// accounts share the file, so the record survives account resets). On start and after each day it checks:
+//   - drawdown from the peak of the live record > StopRuleDrawdown ($5,400 per contract = worse than 99% of
+//     bootstrap outcomes, ~1.8x the worst ever backtested), or
+//   - the last StopRuleMonths (24) months of the live record are negative (needs 24 months of record).
+// If hit: Discord alert, and with EnforceStopRule on it takes NO new entries (open positions still exit).
+// The old "12 months negative" rule was rejected: it fired 14 times since 2017 and every time the
+// following 12 months were profitable. To resume after a review, edit or rename the ledger file.
 namespace NinjaTrader.NinjaScript.Strategies
 {
     public class NoiseAreaMNQ : Strategy
@@ -39,6 +55,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         private StreamWriter log;
         private int decisions, entries, skippedDays;
         private bool wrongBars;
+        // Discord / trade tracking
+        private string discordBotToken = "";
+        private double openPrice; private int openDir;     // +1 long, -1 short, 0 flat
+        private double dayPnl; private int dayTrades; private bool sessionAlertSent; private bool summaryPending;
+        // live record / stop rule
+        private bool stopRuleHit; private string stopRuleReason = "";
+        private double liveTotal, liveDrawdown; private int liveDays;
 
         protected override void OnStateChange()
         {
@@ -57,10 +80,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                 UseVwap = true;
                 HardStopPts = 60;      // resting intrabar catastrophe stop; plateau 40-100 pts (Oct 2026 sweep). 0 = off
                 WriteSignalLog = true; // turn OFF when using the Optimizer
+                EnableDiscord = true;
+                DiscordChannelId = "1490716489211449425";
+                EnforceStopRule = true;
+                StopRuleDrawdown = 5400;
+                StopRuleMonths = 24;
             }
             else if (State == State.DataLoaded)
             {
                 hist = new List<double[]>();
+                if (EnableDiscord) LoadDiscordToken();
                 wrongBars = BarsPeriod.BarsPeriodType != BarsPeriodType.Minute || BarsPeriod.Value != 5;
                 if (wrongBars)
                     Print("NoiseAreaMNQ ERROR: needs 5-minute bars, got " + BarsPeriod + ". Strategy will NOT trade.");
@@ -75,6 +104,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                     catch (Exception e) { Print("NoiseAreaMNQ log open failed: " + e.Message); log = null; }
                 }
+            }
+            else if (State == State.Realtime)
+            {
+                EvaluateStopRule();
+                SendDiscordAlert("NoiseAreaMNQ STARTED | " + Account.Name + " | " + Instrument.FullName + " | " + Contracts + " contract(s) | hard stop " + HardStopPts + " pts"
+                    + string.Format(CultureInfo.InvariantCulture, " | live record {0} days, {1}{2:F0}/contract, drawdown ${3:F0}", liveDays, liveTotal >= 0 ? "+$" : "-$", Math.Abs(liveTotal), -liveDrawdown)
+                    + (wrongBars ? " | ERROR: not on 5-minute bars, NOT trading" : "")
+                    + (stopRuleHit ? " | STOP RULE ACTIVE: " + stopRuleReason + (EnforceStopRule ? " - no new entries" : " - NOT enforced") : ""));
             }
             else if (State == State.Terminated)
             {
@@ -104,12 +141,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 prevClose = lastRthClose;                      // previous session's last RTH close
                 cumTpVol = 0; cumVol = 0;
                 dayValid = prevClose > 0 && dayOpen > 0;
+                dayPnl = 0; dayTrades = 0; sessionAlertSent = false; summaryPending = false;
             }
             else if (t.Date != dayDate)
             {
                 // the 09:35 bar never arrived (data gap / dropout): do not trade on stale state
                 if (today != null && !double.IsNaN(today[Slots - 1])) { hist.Add(today); if (hist.Count > Lookback) hist.RemoveAt(0); }   // full sessions only: holiday/half-day sessions would shrink sigma
                 skippedDays++;
+                SendDiscordAlert("WARNING | no 09:35 bar today (data gap or dropout) | NOT trading today");
                 dayValid = false; today = null; dayDate = t.Date;
             }
 
@@ -120,7 +159,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             cumTpVol += (High[0] + Low[0] + Close[0]) / 3.0 * Volume[0];
             cumVol += Volume[0];
 
-            if (mins == 390) { FlattenAtClose(mins); return; }
+            if (mins == 390)
+            {
+                FlattenAtClose(mins);
+                if (Position.MarketPosition == MarketPosition.Flat) SendDaySummary(); else summaryPending = true;
+                return;
+            }
             if (!dayValid || mins < 30 || mins > 360 || mins % 30 != 0) return;   // 10:00 .. 15:30
 
             double sigma = Sigma(slot);
@@ -133,9 +177,18 @@ namespace NinjaTrader.NinjaScript.Strategies
             double lo = UseVwap ? Math.Min(lower, vwap) : lower;
             double c = Close[0];
             int target = c > hi ? 1 : (c < lo ? -1 : 0);
+            if (stopRuleHit && EnforceStopRule) target = 0;   // stop rule: no new entries, exit at the next decision
             int pos = Position.MarketPosition == MarketPosition.Long ? 1
                     : Position.MarketPosition == MarketPosition.Short ? -1 : 0;
             decisions++;
+
+            if (!sessionAlertSent)
+            {
+                sessionAlertSent = true;
+                SendDiscordAlert(string.Format(CultureInfo.InvariantCulture,
+                    "SESSION {0:ddd dd MMM} | open {1} | prev close {2} | bands {3:F2} / {4:F2} | VWAP {5:F2}",
+                    t, dayOpen, prevClose, upper, lower, vwap));
+            }
 
             if (log != null)
                 log.WriteLine(string.Format(CultureInfo.InvariantCulture,
@@ -161,6 +214,145 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (pos == 1) ExitLong("NA Flat", "NA Long");
                 else if (pos == -1) ExitShort("NA Flat", "NA Short");
             }
+        }
+
+        protected override void OnExecutionUpdate(Execution execution, string executionId, double price, int quantity,
+            MarketPosition marketPosition, string orderId, DateTime time)
+        {
+            if (execution == null || execution.Order == null) return;
+            OrderAction a = execution.Order.OrderAction;
+            string nm = execution.Order.Name;
+            double pv = Instrument.MasterInstrument.PointValue;
+
+            if ((a == OrderAction.Sell && openDir == 1) || (a == OrderAction.BuyToCover && openDir == -1))
+            {
+                double pts = openDir * (price - openPrice);
+                double pnl = pts * quantity * pv;
+                dayPnl += pnl; dayTrades++;
+                string why = nm == "Stop loss" ? "HARD STOP" : nm == "NA Flat" ? "back inside bands" : nm == "NA EOD" || nm == "Exit on session close" ? "end of day" : nm == "Close position" ? "reversal" : nm;
+                SendDiscordAlert(string.Format(CultureInfo.InvariantCulture, "{0} {1} closed @ {2} ({3}) | {4:+0.00;-0.00} pts | {5}{6:F2} | day {7}{8:F2}",
+                    pnl >= 0 ? "✅" : "❌", openDir == 1 ? "LONG" : "SHORT", price, why, pts, pnl >= 0 ? "+$" : "-$", Math.Abs(pnl), dayPnl >= 0 ? "+$" : "-$", Math.Abs(dayPnl)));
+                openDir = 0;
+                if (summaryPending && Position.MarketPosition == MarketPosition.Flat) { summaryPending = false; SendDaySummary(); }
+            }
+            if ((a == OrderAction.Buy && nm == "NA Long") || (a == OrderAction.SellShort && nm == "NA Short"))
+            {
+                openDir = a == OrderAction.Buy ? 1 : -1;
+                openPrice = price;
+                double stop = HardStopPts > 0 ? price - openDir * HardStopPts : 0;
+                SendDiscordAlert(string.Format(CultureInfo.InvariantCulture, "{0} {1} filled @ {2} x{3}{4} | {5:HH:mm} ET",
+                    openDir == 1 ? "📈" : "📉", openDir == 1 ? "LONG" : "SHORT", price, quantity,
+                    stop > 0 ? " | hard stop " + stop.ToString("F2", CultureInfo.InvariantCulture) : "", time));
+            }
+        }
+
+        private void SendDaySummary()
+        {
+            if (State == State.Realtime) RecordLiveDay();
+            SendDiscordAlert(dayTrades == 0 ? "DAY DONE | no trades (price stayed inside the noise area)"
+                : string.Format(CultureInfo.InvariantCulture, "DAY DONE | {0} trade(s) | {1}{2:F2}", dayTrades, dayPnl >= 0 ? "+$" : "-$", Math.Abs(dayPnl)));
+        }
+
+        // ---- live record and stop rule ----
+        private string LedgerPath() { return Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "NoiseAreaMNQ_live_ledger.csv"); }
+
+        private void RecordLiveDay()
+        {
+            try
+            {
+                string path = LedgerPath();
+                if (!File.Exists(path)) File.WriteAllText(path, "date,account,pnl,contracts,pnl_per_contract" + Environment.NewLine);
+                File.AppendAllText(path, string.Format(CultureInfo.InvariantCulture, "{0:yyyy-MM-dd},{1},{2:F2},{3},{4:F2}{5}",
+                    dayDate, Account.Name.Replace(",", " "), dayPnl, Contracts, dayPnl / Math.Max(1, Contracts), Environment.NewLine));
+                bool wasHit = stopRuleHit;
+                EvaluateStopRule();
+                if (stopRuleHit && !wasHit)
+                    SendDiscordAlert("🛑 STOP RULE HIT | " + stopRuleReason + (EnforceStopRule ? " | no new entries until reviewed" : " | NOT enforced (EnforceStopRule off)"));
+            }
+            catch (Exception e) { Print("NoiseAreaMNQ: ledger write failed: " + e.Message); }
+        }
+
+        private void EvaluateStopRule()
+        {
+            stopRuleHit = false; stopRuleReason = ""; liveTotal = 0; liveDrawdown = 0; liveDays = 0;
+            try
+            {
+                string path = LedgerPath();
+                if (!File.Exists(path)) return;
+                // one value per (date, account), last write wins; then average across accounts per date
+                Dictionary<string, double> byDateAcct = new Dictionary<string, double>();
+                foreach (string line in File.ReadAllLines(path))
+                {
+                    string[] f = line.Split(',');
+                    if (f.Length < 5 || f[0] == "date") continue;
+                    double v;
+                    if (!double.TryParse(f[4], NumberStyles.Float, CultureInfo.InvariantCulture, out v)) continue;
+                    byDateAcct[f[0] + "|" + f[1]] = v;
+                }
+                SortedDictionary<DateTime, List<double>> byDate = new SortedDictionary<DateTime, List<double>>();
+                foreach (KeyValuePair<string, double> kv in byDateAcct)
+                {
+                    DateTime dt;
+                    if (!DateTime.TryParseExact(kv.Key.Split('|')[0], "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out dt)) continue;
+                    if (!byDate.ContainsKey(dt)) byDate[dt] = new List<double>();
+                    byDate[dt].Add(kv.Value);
+                }
+                if (byDate.Count == 0) return;
+                double cum = 0, peak = 0;
+                DateTime first = DateTime.MaxValue, last = DateTime.MinValue;
+                foreach (KeyValuePair<DateTime, List<double>> kv in byDate)
+                {
+                    double avg = 0; foreach (double v in kv.Value) avg += v; avg /= kv.Value.Count;
+                    cum += avg; if (cum > peak) peak = cum;
+                    if (kv.Key < first) first = kv.Key; if (kv.Key > last) last = kv.Key;
+                }
+                liveTotal = cum; liveDrawdown = cum - peak; liveDays = byDate.Count;
+                if (-liveDrawdown > StopRuleDrawdown)
+                { stopRuleHit = true; stopRuleReason = string.Format(CultureInfo.InvariantCulture, "drawdown ${0:F0}/contract > ${1:F0}", -liveDrawdown, StopRuleDrawdown); return; }
+                DateTime cutoff = last.AddMonths(-StopRuleMonths);
+                if (first <= cutoff)
+                {
+                    double recent = 0;
+                    foreach (KeyValuePair<DateTime, List<double>> kv in byDate)
+                        if (kv.Key > cutoff) { double avg = 0; foreach (double v in kv.Value) avg += v; recent += avg / kv.Value.Count; }
+                    if (recent < 0)
+                    { stopRuleHit = true; stopRuleReason = string.Format(CultureInfo.InvariantCulture, "last {0} months {1:F0}/contract (negative)", StopRuleMonths, recent); }
+                }
+            }
+            catch (Exception e) { Print("NoiseAreaMNQ: ledger read failed: " + e.Message); }
+        }
+
+        private void LoadDiscordToken()
+        {
+            try
+            {
+                string path = Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "discord_token.txt");
+                if (File.Exists(path)) { discordBotToken = File.ReadAllText(path).Trim(); Print("NoiseAreaMNQ: Discord token loaded"); }
+                else Print("NoiseAreaMNQ: discord_token.txt not found - alerts disabled");
+            }
+            catch (Exception e) { Print("NoiseAreaMNQ: Discord token load failed: " + e.Message); }
+        }
+
+        private void SendDiscordAlert(string message)
+        {
+            if (State != State.Realtime) return;          // NEVER remove: keeps backtests and the Optimizer silent
+            if (!EnableDiscord || string.IsNullOrEmpty(discordBotToken) || string.IsNullOrEmpty(DiscordChannelId)) return;
+            string token = discordBotToken, channel = DiscordChannelId;
+            string json = "{\"content\": \"[NoiseArea] " + message.Replace("\\", "/").Replace("\"", "'") + "\"}";
+            Task.Run(() =>                                  // off the bar thread so a slow Discord call can't delay orders
+            {
+                try
+                {
+                    using (WebClient client = new WebClient())
+                    {
+                        client.Headers[HttpRequestHeader.Authorization] = "Bot " + token;
+                        client.Headers[HttpRequestHeader.ContentType] = "application/json";
+                        client.Encoding = System.Text.Encoding.UTF8;
+                        client.UploadString("https://discord.com/api/v10/channels/" + channel + "/messages", "POST", json);
+                    }
+                }
+                catch (Exception e) { Print("NoiseAreaMNQ: Discord alert failed: " + e.Message); }
+            });
         }
 
         private void FlattenAtClose(int mins)
@@ -200,6 +392,28 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty]
         [Display(Name = "Write signal log", Order = 5, GroupName = "Parameters")]
         public bool WriteSignalLog { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Discord alerts", Order = 6, GroupName = "Alerts")]
+        public bool EnableDiscord { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Discord channel ID", Order = 7, GroupName = "Alerts")]
+        public string DiscordChannelId { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enforce stop rule", Order = 8, GroupName = "Stop rule")]
+        public bool EnforceStopRule { get; set; }
+
+        [NinjaScriptProperty, Range(500, 100000)]
+        [Display(Name = "Stop rule: max drawdown per contract ($)", Order = 9, GroupName = "Stop rule")]
+        public double StopRuleDrawdown { get; set; }
+
+        [NinjaScriptProperty, Range(6, 60)]
+        [Display(Name = "Stop rule: negative over last N months", Order = 10, GroupName = "Stop rule")]
+        public int StopRuleMonths { get; set; }
         #endregion
     }
 }
+
+
