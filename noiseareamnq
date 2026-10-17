@@ -1,0 +1,205 @@
+#region Using declarations
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using System.Globalization;
+using System.IO;
+using NinjaTrader.Cbi;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+#endregion
+
+// NoiseAreaMNQ - gate 2 port of the Noise Area intraday momentum rules
+// (Zarattini, Aziz, Barbon 2024), written to match the Python gate 1 test bar for bar.
+//
+// RUN IT ON: MNQ, 5-MINUTE bars, CME US Index Futures ETH, NT8 timezone = EASTERN.
+// Every time test below reads Time[0] as Eastern. Check the first SIG line of the log:
+// the first decision of a day must be stamped 10:00.
+//
+// Rules (decisions only on bars ending :00 or :30, from 10:00 to 15:30):
+//   move(slot)  = |Close / dayOpen - 1| at that time of day
+//   sigma(slot) = average move(slot) over the previous Lookback sessions
+//   upper = max(dayOpen, prevClose) * (1 + sigma)
+//   lower = min(dayOpen, prevClose) * (1 - sigma)
+//   long  if Close > max(upper, VWAP); short if Close < min(lower, VWAP); else flat
+//   flat on the bar ending 16:00
+// Orders are market orders sent at bar close, so they fill at the next bar's open.
+namespace NinjaTrader.NinjaScript.Strategies
+{
+    public class NoiseAreaMNQ : Strategy
+    {
+        private const int Slots = 78;                 // 09:35 ... 16:00 bar-end times
+        private List<double[]> hist;                  // completed sessions only -> no lookahead
+        private double[] today;
+        private DateTime dayDate = DateTime.MinValue;
+        private bool dayValid;
+        private double dayOpen, prevClose, lastRthClose;
+        private double cumTpVol, cumVol;
+        private StreamWriter log;
+        private int decisions, entries, skippedDays;
+        private bool wrongBars;
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Name = "NoiseAreaMNQ";
+                Description = "Noise Area intraday momentum - gate 2 port";
+                Calculate = Calculate.OnBarClose;
+                EntriesPerDirection = 1;
+                EntryHandling = EntryHandling.AllEntries;
+                IsExitOnSessionCloseStrategy = true;
+                ExitOnSessionCloseSeconds = 30;
+                BarsRequiredToTrade = 1;
+                Lookback = 14;
+                Contracts = 1;
+                UseVwap = true;
+                HardStopPts = 60;      // resting intrabar catastrophe stop; plateau 40-100 pts (Oct 2026 sweep). 0 = off
+                WriteSignalLog = true; // turn OFF when using the Optimizer
+            }
+            else if (State == State.DataLoaded)
+            {
+                hist = new List<double[]>();
+                wrongBars = BarsPeriod.BarsPeriodType != BarsPeriodType.Minute || BarsPeriod.Value != 5;
+                if (wrongBars)
+                    Print("NoiseAreaMNQ ERROR: needs 5-minute bars, got " + BarsPeriod + ". Strategy will NOT trade.");
+                if (WriteSignalLog)
+                {
+                    try
+                    {
+                        string path = Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "NoiseAreaMNQ_signals.csv");
+                        log = new StreamWriter(path, false);
+                        log.WriteLine("date,time,close,dayOpen,prevClose,sigma,upper,lower,vwap,target,posBefore");
+                        Print("NoiseAreaMNQ signal log: " + path);
+                    }
+                    catch (Exception e) { Print("NoiseAreaMNQ log open failed: " + e.Message); log = null; }
+                }
+            }
+            else if (State == State.Terminated)
+            {
+                if (log != null) { try { log.Flush(); log.Dispose(); } catch { } log = null; }
+                if (hist != null)
+                    Print("NoiseAreaMNQ done | decisions " + decisions + " | entries " + entries + " | sessions skipped (no 09:35 bar) " + skippedDays);
+            }
+        }
+
+        protected override void OnBarUpdate()
+        {
+            if (wrongBars || CurrentBar < 1) return;
+
+            DateTime t = Time[0];
+            int mins = t.Hour * 60 + t.Minute - 570;          // minutes after 09:30 at bar END
+            if (mins <= 0 || mins > 390 || mins % 5 != 0) return;   // outside 09:35..16:00
+            int slot = mins / 5 - 1;
+
+            // ---- session start: the bar ending 09:35 ----
+            if (slot == 0)
+            {
+                if (today != null && !double.IsNaN(today[Slots - 1])) { hist.Add(today); if (hist.Count > Lookback) hist.RemoveAt(0); }   // full sessions only: holiday/half-day sessions would shrink sigma
+                today = new double[Slots];
+                for (int i = 0; i < Slots; i++) today[i] = double.NaN;
+                dayDate = t.Date;
+                dayOpen = Open[0];
+                prevClose = lastRthClose;                      // previous session's last RTH close
+                cumTpVol = 0; cumVol = 0;
+                dayValid = prevClose > 0 && dayOpen > 0;
+            }
+            else if (t.Date != dayDate)
+            {
+                // the 09:35 bar never arrived (data gap / dropout): do not trade on stale state
+                if (today != null && !double.IsNaN(today[Slots - 1])) { hist.Add(today); if (hist.Count > Lookback) hist.RemoveAt(0); }   // full sessions only: holiday/half-day sessions would shrink sigma
+                skippedDays++;
+                dayValid = false; today = null; dayDate = t.Date;
+            }
+
+            lastRthClose = Close[0];
+            if (today == null) { FlattenAtClose(mins); return; }
+
+            today[slot] = Math.Abs(Close[0] / dayOpen - 1.0);
+            cumTpVol += (High[0] + Low[0] + Close[0]) / 3.0 * Volume[0];
+            cumVol += Volume[0];
+
+            if (mins == 390) { FlattenAtClose(mins); return; }
+            if (!dayValid || mins < 30 || mins > 360 || mins % 30 != 0) return;   // 10:00 .. 15:30
+
+            double sigma = Sigma(slot);
+            if (double.IsNaN(sigma) || cumVol <= 0) return;
+
+            double vwap = cumTpVol / cumVol;
+            double upper = Math.Max(dayOpen, prevClose) * (1.0 + sigma);
+            double lower = Math.Min(dayOpen, prevClose) * (1.0 - sigma);
+            double hi = UseVwap ? Math.Max(upper, vwap) : upper;
+            double lo = UseVwap ? Math.Min(lower, vwap) : lower;
+            double c = Close[0];
+            int target = c > hi ? 1 : (c < lo ? -1 : 0);
+            int pos = Position.MarketPosition == MarketPosition.Long ? 1
+                    : Position.MarketPosition == MarketPosition.Short ? -1 : 0;
+            decisions++;
+
+            if (log != null)
+                log.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                    "{0:yyyy-MM-dd},{0:HH:mm},{1},{2},{3},{4:F6},{5:F2},{6:F2},{7:F2},{8},{9}",
+                    t, c, dayOpen, prevClose, sigma, upper, lower, vwap, target, pos));
+
+            if (target == pos) return;
+
+            if (target == 1)
+            {
+                if (HardStopPts > 0) SetStopLoss("NA Long", CalculationMode.Ticks, HardStopPts / TickSize, false);
+                EnterLong(Contracts, "NA Long");      // reverses a short automatically
+                entries++;
+            }
+            else if (target == -1)
+            {
+                if (HardStopPts > 0) SetStopLoss("NA Short", CalculationMode.Ticks, HardStopPts / TickSize, false);
+                EnterShort(Contracts, "NA Short");    // reverses a long automatically
+                entries++;
+            }
+            else
+            {
+                if (pos == 1) ExitLong("NA Flat", "NA Long");
+                else if (pos == -1) ExitShort("NA Flat", "NA Short");
+            }
+        }
+
+        private void FlattenAtClose(int mins)
+        {
+            if (mins != 390) return;
+            if (Position.MarketPosition == MarketPosition.Long) ExitLong("NA EOD", "NA Long");
+            else if (Position.MarketPosition == MarketPosition.Short) ExitShort("NA EOD", "NA Short");
+        }
+
+        // average move at this time of day over the stored completed sessions
+        private double Sigma(int slot)
+        {
+            if (hist.Count < Lookback) return double.NaN;
+            double sum = 0; int n = 0;
+            for (int i = 0; i < hist.Count; i++)
+                if (!double.IsNaN(hist[i][slot])) { sum += hist[i][slot]; n++; }
+            return n >= Lookback - 4 ? sum / n : double.NaN;
+        }
+
+        #region Properties
+        [NinjaScriptProperty, Range(2, 250)]
+        [Display(Name = "Lookback (sessions)", Order = 1, GroupName = "Parameters")]
+        public int Lookback { get; set; }
+
+        [NinjaScriptProperty, Range(1, 50)]
+        [Display(Name = "Contracts", Order = 2, GroupName = "Parameters")]
+        public int Contracts { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Use VWAP in stop/entry", Order = 3, GroupName = "Parameters")]
+        public bool UseVwap { get; set; }
+
+        [NinjaScriptProperty, Range(0, 2000)]
+        [Display(Name = "Hard stop (points, 0 = off)", Order = 4, GroupName = "Parameters")]
+        public double HardStopPts { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Write signal log", Order = 5, GroupName = "Parameters")]
+        public bool WriteSignalLog { get; set; }
+        #endregion
+    }
+}
