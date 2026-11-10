@@ -41,6 +41,38 @@ using NinjaTrader.NinjaScript;
 // If hit: Discord alert, and with EnforceStopRule on it takes NO new entries (open positions still exit).
 // The old "12 months negative" rule was rejected: it fired 14 times since 2017 and every time the
 // following 12 months were profitable. To resume after a review, edit or rename the ledger file.
+//
+// RELIABILITY (Oct 21 2026) - trading rules unchanged; alerts and safety nets only:
+//   - HEARTBEAT: if HeartbeatUrl is set (e.g. a healthchecks.io ping URL), every realtime 5-min bar from
+//     09:35 to 16:00 ET pings it. healthchecks.io then alerts you if pings STOP (NT8 crash, VPS reboot,
+//     strategy disabled, frozen feed) - the one failure Discord alone can never report.
+//   - CONNECTION alerts: Discord on loss / restore of the price or order connection.
+//   - PROFIT TARGET (Nov 10 2026): resting limit target ProfitTargetPts, default 160. Adopted after NT8 MNQ 2020-2026:
+//     160 passed every pre-registered rule (Sharpe 1.32/1.47 vs 1.31/1.31 by half, net 92%, 150K funded blow-up
+//     21.6% -> 12.5%, eval pass 50K 84% -> 88%, 150K 88% -> 91%); plateau 140-180 confirmed. 0 = off (old behaviour).
+//   - SYNC GUARD (Nov 5 2026, after the Contabo crash missed a +790-pt day): Start behavior defaults to
+//     "Immediately submit, synchronize account" so a restart JOINS the strategy's open position instead of sitting
+//     the day out. Every 5-min bar in realtime compares strategy vs account position; after 10 min out of sync it
+//     alerts loudly, marks the day OUT OF SYNC, labels further fill alerts as PAPER, and does NOT write the day
+//     to the live ledger (no more phantom P&L).
+//   - POSITION MISMATCH alert on start: strategy position vs real account position (orphaned position
+//     after a restart = nobody will flatten it at 16:00).
+//   - SIGMA NOT READY alert at 09:35: fewer than Lookback full sessions loaded = it would silently never trade.
+//   - DATA GAP alert: realtime bars missing inside the session (a decision may have been skipped).
+//   - BACKUP FLATTEN: still in a position after the 16:00 bar (exit missed/rejected) -> exit again + alert.
+//   - LEDGER: shared lock + retry so two accounts writing at 16:00 can't lose a row; Discord alert (with the
+//     row to add by hand) if a write still fails.
+//
+// FILL QUALITY (Oct 31 2026) - trading rules unchanged; alerts and logging only:
+//   The Oct 31 review found ~1/3 of all profit is made in the 5 minutes after a :00/:30 fill, so fill quality
+//   at the mark is the number to watch. Every LIVE fill now reports, in Discord and in
+//   Documents\NinjaTrader 8\NoiseAreaMNQ_fills.csv (one row per fill, all accounts):
+//     reference price (signal bar close for entries/signal exits, 16:00 close for EOD exits, stop price for stops),
+//     slippage in points (+ = filled worse than the reference) and seconds after the reference bar's end.
+//   DAY DONE adds the day's fill count and average slippage. The backtest assumes ~0.5 pt/side slippage
+//   (2 ticks) + commission; sustained > 1 pt/side live means the backtest is too optimistic.
+//   Split fills (possible at 2+ contracts) are now combined into one alert at the average price, so the
+//   ledger P&L stays right on multi-contract accounts.
 namespace NinjaTrader.NinjaScript.Strategies
 {
     public class NoiseAreaMNQ : Strategy
@@ -54,6 +86,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double cumTpVol, cumVol;
         private StreamWriter log;
         private int decisions, entries, skippedDays;
+        private int mismatchBars; private bool dayOutOfSync;   // sync guard
         private bool wrongBars;
         // Discord / trade tracking
         private string discordBotToken = "";
@@ -62,6 +95,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         // live record / stop rule
         private bool stopRuleHit; private string stopRuleReason = "";
         private double liveTotal, liveDrawdown; private int liveDays;
+        // reliability
+        private int lastMins = -1; private DateTime lastBarDate = DateTime.MinValue;
+        private DateTime backupFlattenDate = DateTime.MinValue;
+        // fill quality
+        private double sigClose; private DateTime sigTime = DateTime.MinValue;     // decision bar close / end time
+        private double eodClose; private DateTime eodTime = DateTime.MinValue;     // 16:00 bar close / end time
+        private double entryPxQty, exitPxQty; private int entryQty, exitQty;       // split-fill accumulators
+        private double daySlipSum; private int daySlipN;
 
         protected override void OnStateChange()
         {
@@ -78,13 +119,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Lookback = 14;
                 Contracts = 1;
                 UseVwap = true;
-                HardStopPts = 60;      // resting intrabar catastrophe stop; plateau 40-100 pts (Oct 2026 sweep). 0 = off
-                WriteSignalLog = true; // turn OFF when using the Optimizer
+                HardStopPts = 60;
+                ProfitTargetPts = 160;   // Nov 10 2026: adopted (E3). 0 = off      // resting intrabar catastrophe stop; plateau 40-100 pts (Oct 2026 sweep). 0 = off
+                WriteSignalLog = false; // live default OFF
                 EnableDiscord = true;
                 DiscordChannelId = "1490716489211449425";
                 EnforceStopRule = true;
                 StopRuleDrawdown = 5400;
                 StopRuleMonths = 24;
+                HeartbeatUrl = "";
+                AlertTag = "NoiseArea";
+                StartBehavior = StartBehavior.ImmediatelySubmitSynchronizeAccount;   // after a restart: join the open position
             }
             else if (State == State.DataLoaded)
             {
@@ -108,10 +153,21 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (State == State.Realtime)
             {
                 EvaluateStopRule();
-                SendDiscordAlert("NoiseAreaMNQ STARTED | " + Account.Name + " | " + Instrument.FullName + " | " + Contracts + " contract(s) | hard stop " + HardStopPts + " pts"
+                SendDiscordAlert("NoiseAreaMNQ STARTED | " + Account.Name + " | " + Instrument.FullName + " | " + Contracts + " contract(s) | hard stop " + HardStopPts + " pts | target " + (ProfitTargetPts > 0 ? ProfitTargetPts + " pts" : "off")
                     + string.Format(CultureInfo.InvariantCulture, " | live record {0} days, {1}{2:F0}/contract, drawdown ${3:F0}", liveDays, liveTotal >= 0 ? "+$" : "-$", Math.Abs(liveTotal), -liveDrawdown)
                     + (wrongBars ? " | ERROR: not on 5-minute bars, NOT trading" : "")
-                    + (stopRuleHit ? " | STOP RULE ACTIVE: " + stopRuleReason + (EnforceStopRule ? " - no new entries" : " - NOT enforced") : ""));
+                    + (stopRuleHit ? " | STOP RULE ACTIVE: " + stopRuleReason + (EnforceStopRule ? " - no new entries" : " - NOT enforced") : "")
+                    + (string.IsNullOrEmpty(HeartbeatUrl) ? " | heartbeat OFF" : " | heartbeat on"));
+                // orphaned / mismatched position after a restart: nobody would flatten it at 16:00
+                try
+                {
+                    MarketPosition sp = Position.MarketPosition, ap = PositionAccount.MarketPosition;
+                    if (sp != ap || Position.Quantity != PositionAccount.Quantity)
+                        SendDiscordAlert("⚠️ POSITION MISMATCH | strategy " + sp + " " + Position.Quantity + " vs account " + ap + " " + PositionAccount.Quantity
+                            + " | check the account NOW - an unmanaged position will NOT be flattened at 16:00");
+                }
+                catch (Exception e) { Print("NoiseAreaMNQ: position check failed: " + e.Message); }
+                Heartbeat();
             }
             else if (State == State.Terminated)
             {
@@ -127,8 +183,28 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             DateTime t = Time[0];
             int mins = t.Hour * 60 + t.Minute - 570;          // minutes after 09:30 at bar END
+            // backup flatten: still holding after the 16:00 bar (exit missed or rejected) -> exit again, alert once per day
+            if (mins > 390 && mins <= 450 && Position.MarketPosition != MarketPosition.Flat && backupFlattenDate != t.Date)
+            {
+                backupFlattenDate = t.Date;
+                eodClose = Close[0]; eodTime = t;
+                if (Position.MarketPosition == MarketPosition.Long) ExitLong("NA EOD backup", "NA Long");
+                else ExitShort("NA EOD backup", "NA Short");
+                SendDiscordAlert("⚠️ STILL IN POSITION AFTER 16:00 | backup exit sent | check the account");
+            }
             if (mins <= 0 || mins > 390 || mins % 5 != 0) return;   // outside 09:35..16:00
             int slot = mins / 5 - 1;
+
+            if (State == State.Realtime)
+            {
+                Heartbeat();
+                CheckSync(t);
+                if (t.Date == lastBarDate && lastMins > 0 && mins - lastMins > 5)
+                    SendDiscordAlert(string.Format(CultureInfo.InvariantCulture, "⚠️ DATA GAP | no bars between {0} and {1} ET{2}",
+                        MinsToClock(lastMins), MinsToClock(mins),
+                        GapHasDecision(lastMins, mins) ? " | a half-hour DECISION was skipped" : ""));
+            }
+            lastMins = mins; lastBarDate = t.Date;
 
             // ---- session start: the bar ending 09:35 ----
             if (slot == 0)
@@ -142,6 +218,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 cumTpVol = 0; cumVol = 0;
                 dayValid = prevClose > 0 && dayOpen > 0;
                 dayPnl = 0; dayTrades = 0; sessionAlertSent = false; summaryPending = false;
+                dayOutOfSync = mismatchBars >= 2;   // carry an unresolved mismatch into the new day
+                daySlipSum = 0; daySlipN = 0;
+                if (State == State.Realtime && hist.Count < Lookback)
+                    SendDiscordAlert("⚠️ SIGMA NOT READY | only " + hist.Count + " of " + Lookback + " full sessions loaded | will NOT trade today - raise Days to load and re-enable");
             }
             else if (t.Date != dayDate)
             {
@@ -196,16 +276,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                     t, c, dayOpen, prevClose, sigma, upper, lower, vwap, target, pos));
 
             if (target == pos) return;
+            sigClose = c; sigTime = t;                        // reference for the fill-quality report
 
             if (target == 1)
             {
                 if (HardStopPts > 0) SetStopLoss("NA Long", CalculationMode.Ticks, HardStopPts / TickSize, false);
+                if (ProfitTargetPts > 0) SetProfitTarget("NA Long", CalculationMode.Ticks, ProfitTargetPts / TickSize);
                 EnterLong(Contracts, "NA Long");      // reverses a short automatically
                 entries++;
             }
             else if (target == -1)
             {
                 if (HardStopPts > 0) SetStopLoss("NA Short", CalculationMode.Ticks, HardStopPts / TickSize, false);
+                if (ProfitTargetPts > 0) SetProfitTarget("NA Short", CalculationMode.Ticks, ProfitTargetPts / TickSize);
                 EnterShort(Contracts, "NA Short");    // reverses a long automatically
                 entries++;
             }
@@ -220,56 +303,152 @@ namespace NinjaTrader.NinjaScript.Strategies
             MarketPosition marketPosition, string orderId, DateTime time)
         {
             if (execution == null || execution.Order == null) return;
-            OrderAction a = execution.Order.OrderAction;
-            string nm = execution.Order.Name;
+            NinjaTrader.Cbi.Order o = execution.Order;
+            OrderAction a = o.OrderAction;
+            string nm = o.Name;
             double pv = Instrument.MasterInstrument.PointValue;
+            bool lastPiece = o.OrderState != OrderState.PartFilled;   // a split fill is reported once, on its last piece
 
             if ((a == OrderAction.Sell && openDir == 1) || (a == OrderAction.BuyToCover && openDir == -1))
             {
-                double pts = openDir * (price - openPrice);
-                double pnl = pts * quantity * pv;
+                exitPxQty += price * quantity; exitQty += quantity;
+                if (!lastPiece) return;
+                double px = exitPxQty / exitQty; int q = exitQty;
+                exitPxQty = 0; exitQty = 0;
+                double pts = openDir * (px - openPrice);
+                double pnl = pts * q * pv;
                 dayPnl += pnl; dayTrades++;
-                string why = nm == "Stop loss" ? "HARD STOP" : nm == "NA Flat" ? "back inside bands" : nm == "NA EOD" || nm == "Exit on session close" ? "end of day" : nm == "Close position" ? "reversal" : nm;
-                SendDiscordAlert(string.Format(CultureInfo.InvariantCulture, "{0} {1} closed @ {2} ({3}) | {4:+0.00;-0.00} pts | {5}{6:F2} | day {7}{8:F2}",
-                    pnl >= 0 ? "✅" : "❌", openDir == 1 ? "LONG" : "SHORT", price, why, pts, pnl >= 0 ? "+$" : "-$", Math.Abs(pnl), dayPnl >= 0 ? "+$" : "-$", Math.Abs(dayPnl)));
+                bool isStop = nm == "Stop loss";
+                bool isEod = nm == "NA EOD" || nm == "NA EOD backup" || nm == "Exit on session close";
+                bool isTarget = nm == "Profit target";
+                string why = isStop ? "HARD STOP" : isTarget ? "PROFIT TARGET" : nm == "NA Flat" ? "back inside bands" : isEod ? "end of day" : nm == "Close position" ? "reversal" : nm;
+                double refPx = isStop ? openPrice - openDir * HardStopPts : isTarget ? openPrice + openDir * ProfitTargetPts : isEod ? eodClose : sigClose;
+                DateTime refT = (isStop || isTarget) ? DateTime.MinValue : isEod ? eodTime : sigTime;
+                double slip = openDir * (refPx - px);              // exit: + = filled worse than the reference
+                string fq = FillQuality(isStop ? "stop" : isTarget ? "target" : isEod ? "16:00 close" : "signal", refPx, refT, slip, time);
+                LogFill("EXIT", why, openDir, q, refPx, refT, px, slip, time);
+                SendDiscordAlert(PaperTag() + string.Format(CultureInfo.InvariantCulture, "{0} {1} closed @ {2} ({3}) | {4:+0.00;-0.00} pts | {5}{6:F2} | day {7}{8:F2}{9}",
+                    pnl >= 0 ? "✅" : "❌", openDir == 1 ? "LONG" : "SHORT", px, why, pts, pnl >= 0 ? "+$" : "-$", Math.Abs(pnl), dayPnl >= 0 ? "+$" : "-$", Math.Abs(dayPnl), fq));
                 openDir = 0;
                 if (summaryPending && Position.MarketPosition == MarketPosition.Flat) { summaryPending = false; SendDaySummary(); }
+                return;
             }
             if ((a == OrderAction.Buy && nm == "NA Long") || (a == OrderAction.SellShort && nm == "NA Short"))
             {
+                entryPxQty += price * quantity; entryQty += quantity;
+                if (!lastPiece) return;
                 openDir = a == OrderAction.Buy ? 1 : -1;
-                openPrice = price;
-                double stop = HardStopPts > 0 ? price - openDir * HardStopPts : 0;
-                SendDiscordAlert(string.Format(CultureInfo.InvariantCulture, "{0} {1} filled @ {2} x{3}{4} | {5:HH:mm} ET",
-                    openDir == 1 ? "📈" : "📉", openDir == 1 ? "LONG" : "SHORT", price, quantity,
-                    stop > 0 ? " | hard stop " + stop.ToString("F2", CultureInfo.InvariantCulture) : "", time));
+                openPrice = entryPxQty / entryQty; int q = entryQty;
+                entryPxQty = 0; entryQty = 0;
+                double slip = openDir * (openPrice - sigClose);    // entry: + = paid more than the signal bar's close
+                string fq = FillQuality("signal", sigClose, sigTime, slip, time);
+                LogFill("ENTRY", openDir == 1 ? "long signal" : "short signal", openDir, q, sigClose, sigTime, openPrice, slip, time);
+                double stop = HardStopPts > 0 ? openPrice - openDir * HardStopPts : 0;
+                SendDiscordAlert(PaperTag() + string.Format(CultureInfo.InvariantCulture, "{0} {1} filled @ {2} x{3}{4} | {5:HH:mm} ET{6}",
+                    openDir == 1 ? "📈" : "📉", openDir == 1 ? "LONG" : "SHORT", openPrice, q,
+                    stop > 0 ? " | hard stop " + stop.ToString("F2", CultureInfo.InvariantCulture) : "", time, fq));
             }
+        }
+
+        // " | signal 29290.50 @10:00 | slip +0.25 pts | 0.8 s" ; also feeds the day's average
+        private string FillQuality(string label, double refPx, DateTime refT, double slip, DateTime fillTime)
+        {
+            if (refPx <= 0) return "";
+            daySlipSum += slip; daySlipN++;
+            string secs = SecsAfter(refT, fillTime);
+            return string.Format(CultureInfo.InvariantCulture, " | {0} {1:F2}{2} | slip {3:+0.00;-0.00} pts{4}",
+                label, refPx, refT == DateTime.MinValue ? "" : " @" + refT.ToString("HH:mm", CultureInfo.InvariantCulture), slip,
+                secs == "" ? "" : " | " + secs + " s");
+        }
+
+        private static string SecsAfter(DateTime refT, DateTime fillTime)
+        {
+            if (refT == DateTime.MinValue) return "";
+            double s = (fillTime - refT).TotalSeconds;
+            return s < -60 || s > 6 * 3600 ? "" : s.ToString("F1", CultureInfo.InvariantCulture);
+        }
+
+        private static readonly object FillsLock = new object();
+
+        // one row per live fill, shared by all accounts: Documents\NinjaTrader 8\NoiseAreaMNQ_fills.csv
+        private void LogFill(string evt, string reason, int dir, int qty, double refPx, DateTime refT, double fill, double slip, DateTime fillTime)
+        {
+            if (State != State.Realtime) return;
+            string row = string.Join(",", new string[] {
+                fillTime.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), fillTime.ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture),
+                Account.Name.Replace(",", " "), Instrument.FullName.Replace(",", " "), evt, reason, dir > 0 ? "long" : "short",
+                qty.ToString(CultureInfo.InvariantCulture),
+                refPx > 0 ? refPx.ToString("F2", CultureInfo.InvariantCulture) : "",
+                refT == DateTime.MinValue ? "" : refT.ToString("HH:mm:ss", CultureInfo.InvariantCulture),
+                fill.ToString("F2", CultureInfo.InvariantCulture),
+                refPx > 0 ? slip.ToString("F2", CultureInfo.InvariantCulture) : "",
+                SecsAfter(refT, fillTime) }) + Environment.NewLine;
+            try
+            {
+                lock (FillsLock)
+                {
+                    string path = Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "NoiseAreaMNQ_fills.csv");
+                    WithRetry(() =>
+                    {
+                        if (!File.Exists(path)) File.WriteAllText(path, "date,time,account,instrument,event,reason,position,contracts,reference,reference_time,fill,slip_pts,secs_after_reference" + Environment.NewLine);
+                        File.AppendAllText(path, row);
+                    });
+                }
+            }
+            catch (Exception e) { Print("NoiseAreaMNQ: fills log write failed: " + e.Message); }
         }
 
         private void SendDaySummary()
         {
-            if (State == State.Realtime) RecordLiveDay();
+            if (State == State.Realtime && !dayOutOfSync) RecordLiveDay();
+            if (State == State.Realtime && dayOutOfSync)
+                SendDiscordAlert("⚠️ DAY NOT RECORDED in the live ledger: strategy and account were OUT OF SYNC today - the P&L below is PAPER, check the Lucid dashboard");
             SendDiscordAlert(dayTrades == 0 ? "DAY DONE | no trades (price stayed inside the noise area)"
-                : string.Format(CultureInfo.InvariantCulture, "DAY DONE | {0} trade(s) | {1}{2:F2}", dayTrades, dayPnl >= 0 ? "+$" : "-$", Math.Abs(dayPnl)));
+                : string.Format(CultureInfo.InvariantCulture, "DAY DONE | {0} trade(s) | {1}{2:F2}{3}", dayTrades, dayPnl >= 0 ? "+$" : "-$", Math.Abs(dayPnl),
+                    daySlipN > 0 ? string.Format(CultureInfo.InvariantCulture, " | {0} fills, avg slip {1:+0.00;-0.00} pts", daySlipN, daySlipSum / daySlipN) : ""));
         }
 
         // ---- live record and stop rule ----
         private string LedgerPath() { return Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "NoiseAreaMNQ_live_ledger.csv"); }
 
+        // shared by every NoiseAreaMNQ instance in this NT8 process: several accounts write at 16:00 at the same moment
+        private static readonly object LedgerLock = new object();
+
+        // retries a file operation a few times if another instance (or Excel, antivirus) holds the file
+        private static void WithRetry(Action op)
+        {
+            for (int attempt = 1; ; attempt++)
+            {
+                try { op(); return; }
+                catch (IOException) { if (attempt >= 5) throw; System.Threading.Thread.Sleep(200 * attempt); }
+            }
+        }
+
         private void RecordLiveDay()
         {
+            string row = string.Format(CultureInfo.InvariantCulture, "{0:yyyy-MM-dd},{1},{2:F2},{3},{4:F2}{5}",
+                dayDate, Account.Name.Replace(",", " "), dayPnl, Contracts, dayPnl / Math.Max(1, Contracts), Environment.NewLine);
             try
             {
-                string path = LedgerPath();
-                if (!File.Exists(path)) File.WriteAllText(path, "date,account,pnl,contracts,pnl_per_contract" + Environment.NewLine);
-                File.AppendAllText(path, string.Format(CultureInfo.InvariantCulture, "{0:yyyy-MM-dd},{1},{2:F2},{3},{4:F2}{5}",
-                    dayDate, Account.Name.Replace(",", " "), dayPnl, Contracts, dayPnl / Math.Max(1, Contracts), Environment.NewLine));
-                bool wasHit = stopRuleHit;
-                EvaluateStopRule();
-                if (stopRuleHit && !wasHit)
-                    SendDiscordAlert("🛑 STOP RULE HIT | " + stopRuleReason + (EnforceStopRule ? " | no new entries until reviewed" : " | NOT enforced (EnforceStopRule off)"));
+                lock (LedgerLock)
+                {
+                    string path = LedgerPath();
+                    WithRetry(() =>
+                    {
+                        if (!File.Exists(path)) File.WriteAllText(path, "date,account,pnl,contracts,pnl_per_contract" + Environment.NewLine);
+                        File.AppendAllText(path, row);
+                    });
+                    bool wasHit = stopRuleHit;
+                    EvaluateStopRule();
+                    if (stopRuleHit && !wasHit)
+                        SendDiscordAlert("🛑 STOP RULE HIT | " + stopRuleReason + (EnforceStopRule ? " | no new entries until reviewed" : " | NOT enforced (EnforceStopRule off)"));
+                }
             }
-            catch (Exception e) { Print("NoiseAreaMNQ: ledger write failed: " + e.Message); }
+            catch (Exception e)
+            {
+                Print("NoiseAreaMNQ: ledger write failed: " + e.Message);
+                SendDiscordAlert("⚠️ LEDGER WRITE FAILED | add this row by hand: " + row.Trim() + " | " + e.Message);
+            }
         }
 
         private void EvaluateStopRule()
@@ -279,9 +458,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 string path = LedgerPath();
                 if (!File.Exists(path)) return;
+                string[] lines = null;
+                lock (LedgerLock) { WithRetry(() => { lines = File.ReadAllLines(path); }); }
                 // one value per (date, account), last write wins; then average across accounts per date
                 Dictionary<string, double> byDateAcct = new Dictionary<string, double>();
-                foreach (string line in File.ReadAllLines(path))
+                foreach (string line in lines)
                 {
                     string[] f = line.Split(',');
                     if (f.Length < 5 || f[0] == "date") continue;
@@ -338,7 +519,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (State != State.Realtime) return;          // NEVER remove: keeps backtests and the Optimizer silent
             if (!EnableDiscord || string.IsNullOrEmpty(discordBotToken) || string.IsNullOrEmpty(DiscordChannelId)) return;
             string token = discordBotToken, channel = DiscordChannelId;
-            string json = "{\"content\": \"[NoiseArea] " + message.Replace("\\", "/").Replace("\"", "'") + "\"}";
+            string json = "{\"content\": \"[" + AlertTag + "] " + message.Replace("\\", "/").Replace("\"", "'") + "\"}";
             Task.Run(() =>                                  // off the bar thread so a slow Discord call can't delay orders
             {
                 try
@@ -355,9 +536,66 @@ namespace NinjaTrader.NinjaScript.Strategies
             });
         }
 
+        protected override void OnConnectionStatusUpdate(ConnectionStatusEventArgs connectionStatusUpdate)
+        {
+            if (connectionStatusUpdate == null) return;
+            ConnectionStatus os = connectionStatusUpdate.Status, op = connectionStatusUpdate.PreviousStatus;
+            ConnectionStatus ps = connectionStatusUpdate.PriceStatus, pp = connectionStatusUpdate.PreviousPriceStatus;
+            bool lost = (op == ConnectionStatus.Connected && os != ConnectionStatus.Connected)
+                     || (pp == ConnectionStatus.Connected && ps != ConnectionStatus.Connected);
+            bool back = (op != ConnectionStatus.Connected && os == ConnectionStatus.Connected && ps == ConnectionStatus.Connected)
+                     || (pp != ConnectionStatus.Connected && ps == ConnectionStatus.Connected && os == ConnectionStatus.Connected);
+            if (lost) SendDiscordAlert("🔌 CONNECTION LOST | orders " + os + " | data " + ps + " | resting stop stays at the broker; watch for restore");
+            else if (back) SendDiscordAlert("🔌 CONNECTION RESTORED | orders " + os + " | data " + ps + " | position " + Position.MarketPosition);
+        }
+
+        // healthchecks.io-style dead-man's switch: a missing ping is what raises the alarm
+        private void Heartbeat()
+        {
+            if (State != State.Realtime || string.IsNullOrEmpty(HeartbeatUrl)) return;
+            string url = HeartbeatUrl;
+            Task.Run(() =>
+            {
+                try { using (WebClient client = new WebClient()) client.DownloadString(url); }
+                catch (Exception e) { Print("NoiseAreaMNQ: heartbeat failed: " + e.Message); }
+            });
+        }
+
+        private static string MinsToClock(int m) { int x = 570 + m; return (x / 60).ToString("00") + ":" + (x % 60).ToString("00"); }
+
+        // true if a decision bar end (10:00 .. 15:30, every 30 min) lies strictly between two processed bar ends
+        private static bool GapHasDecision(int from, int to)
+        {
+            for (int m = from + 5; m < to; m += 5) if (m >= 30 && m <= 360 && m % 30 == 0) return true;
+            return false;
+        }
+
+        // ---- sync guard ----
+        private string PaperTag() { return dayOutOfSync ? "📄 PAPER ONLY (account not in this position) | " : ""; }
+
+        private void CheckSync(DateTime t)
+        {
+            try
+            {
+                bool match = Position.MarketPosition == PositionAccount.MarketPosition && Position.Quantity == PositionAccount.Quantity;
+                if (match) { if (mismatchBars >= 2) SendDiscordAlert("✅ BACK IN SYNC | strategy and account both " + Position.MarketPosition); mismatchBars = 0; return; }
+                mismatchBars++;
+                if (mismatchBars == 2)   // 10 minutes out of sync: not a fill in flight, a real problem
+                {
+                    dayOutOfSync = true;
+                    SendDiscordAlert("🚨 OUT OF SYNC | strategy " + Position.MarketPosition + " " + Position.Quantity + " vs account " + PositionAccount.MarketPosition + " " + PositionAccount.Quantity
+                        + " | trades are NOT reaching the account | fix: disable, then re-enable with Start behavior = Immediately submit, synchronize account");
+                }
+                else if (mismatchBars % 6 == 0)   // repeat every 30 min
+                    SendDiscordAlert("🚨 STILL OUT OF SYNC for " + (mismatchBars * 5) + " min | strategy " + Position.MarketPosition + " vs account " + PositionAccount.MarketPosition);
+            }
+            catch (Exception e) { Print("NoiseAreaMNQ: sync check failed: " + e.Message); }
+        }
+
         private void FlattenAtClose(int mins)
         {
             if (mins != 390) return;
+            eodClose = Close[0]; eodTime = Time[0];
             if (Position.MarketPosition == MarketPosition.Long) ExitLong("NA EOD", "NA Long");
             else if (Position.MarketPosition == MarketPosition.Short) ExitShort("NA EOD", "NA Short");
         }
@@ -389,6 +627,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "Hard stop (points, 0 = off)", Order = 4, GroupName = "Parameters")]
         public double HardStopPts { get; set; }
 
+        [NinjaScriptProperty, Range(0, 2000)]
+        [Display(Name = "Profit target (points, 0 = off)", Order = 5, GroupName = "Parameters")]
+        public double ProfitTargetPts { get; set; }
+
         [NinjaScriptProperty]
         [Display(Name = "Write signal log", Order = 5, GroupName = "Parameters")]
         public bool WriteSignalLog { get; set; }
@@ -412,8 +654,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty, Range(6, 60)]
         [Display(Name = "Stop rule: negative over last N months", Order = 10, GroupName = "Stop rule")]
         public int StopRuleMonths { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Heartbeat URL (healthchecks.io ping, empty = off)", Order = 11, GroupName = "Alerts")]
+        public string HeartbeatUrl { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Discord tag (e.g. NoiseArea / NoiseArea 150K)", Order = 12, GroupName = "Alerts")]
+        public string AlertTag { get; set; }
         #endregion
     }
 }
-
-
