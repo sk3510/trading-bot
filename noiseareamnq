@@ -50,6 +50,9 @@ using NinjaTrader.NinjaScript;
 //   - PROFIT TARGET (Nov 10 2026): resting limit target ProfitTargetPts, default 160. Adopted after NT8 MNQ 2020-2026:
 //     160 passed every pre-registered rule (Sharpe 1.32/1.47 vs 1.31/1.31 by half, net 92%, 150K funded blow-up
 //     21.6% -> 12.5%, eval pass 50K 84% -> 88%, 150K 88% -> 91%); plateau 140-180 confirmed. 0 = off (old behaviour).
+//   - v5 (Nov 11 2026): defaults HardStopPts 60 -> 50, ProfitTargetPts 160 -> 110. NT8 MNQ 2020-2026: Sharpe 1.54 vs 1.39,
+//     2020-23 1.67 vs 1.56, 2024-26 1.45 vs 1.25, max DD $1,387 vs $2,817; 3x3 neighbours (45-55 x 90-110) all beat v4
+//     in 2024-26; QQQ 2016-26 Sharpe 1.36 vs 1.19, unseen 2016-19 0.74 vs 0.68. Trading logic unchanged.
 //   - SYNC GUARD (Nov 5 2026, after the Contabo crash missed a +790-pt day): Start behavior defaults to
 //     "Immediately submit, synchronize account" so a restart JOINS the strategy's open position instead of sitting
 //     the day out. Every 5-min bar in realtime compares strategy vs account position; after 10 min out of sync it
@@ -119,8 +122,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Lookback = 14;
                 Contracts = 1;
                 UseVwap = true;
-                HardStopPts = 60;
-                ProfitTargetPts = 160;   // Nov 10 2026: adopted (E3). 0 = off      // resting intrabar catastrophe stop; plateau 40-100 pts (Oct 2026 sweep). 0 = off
+                HardStopPts = 50;
+                ProfitTargetPts = 110;   // v5 Nov 11 2026 (was 160). 0 = off      // resting intrabar catastrophe stop; plateau 40-100 pts (Oct 2026 sweep). 0 = off
                 WriteSignalLog = false; // live default OFF
                 EnableDiscord = true;
                 DiscordChannelId = "1490716489211449425";
